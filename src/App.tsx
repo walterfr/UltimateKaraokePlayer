@@ -5,6 +5,7 @@ import {
   Monitor, Users, ListMusic, Equalizer
 } from 'lucide-react';
 import { invoke } from '@tauri-apps/api/tauri';
+import { open } from '@tauri-apps/api/dialog';
 import CdgCanvas from './components/CdgCanvas';
 
 const App = () => {
@@ -12,16 +13,29 @@ const App = () => {
   const [currentTime, setCurrentTime] = useState('00:00');
 
   const handlePlayToggle = async () => {
-    const nextState = !isPlaying;
-    setIsPlaying(nextState);
-    if (nextState) {
+    if (!isPlaying) {
       try {
-        // Dispara a leitura do arquivo no backend via Tauri IPC.
-        // O Rust retornará eventos assíncronos no canal "cdg_batch" que o CdgCanvas já está escutando.
-        await invoke('play_song', { path: 'dummy_music.mp3' });
+        // Abre uma janela nativa do Windows pedindo para o usuário escolher o arquivo de áudio
+        const selectedPath = await open({
+          multiple: false,
+          title: 'Selecione a Música de Karaokê (MP3)',
+          filters: [{
+            name: 'Audio Files',
+            extensions: ['mp3', 'wav', 'flac', 'ogg']
+          }]
+        });
+
+        if (selectedPath && typeof selectedPath === 'string') {
+          setIsPlaying(true);
+          // O backend automaticamente procurará um .cdg na mesma pasta com o mesmo nome!
+          await invoke('play_song', { path: selectedPath });
+        }
       } catch (e) {
-        console.error('Error starting playback:', e);
+        console.error('Error selecting or playing file:', e);
       }
+    } else {
+      setIsPlaying(false);
+      // Aqui idealmente pararíamos a música (AudioCommand::Stop) se o Tauri Backend tiver esse listener
     }
   };
 

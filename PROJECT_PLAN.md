@@ -19,7 +19,7 @@ Criar o player de karaokê definitivo com compatibilidade total de formatos, uti
 
 ### Fase 1: Motores de Mídia (Atual)
 Implementação individual de cada motor de reprodução, seguida de validação com arquivos de teste.
-1. [ ] CDG Engine (MP3+G) - *Parser concluído, pendente renderização/áudio*
+1. [x] CDG Engine (MP3+G) - *Parser, Áudio e Sincronização concluídos com sucesso!*
 2. [ ] Synth Engine (MIDI/KAR)
 3. [ ] Video Engine (MP4/ASS)
 4. [ ] Tracker Engine (ST3/XM)
@@ -44,5 +44,6 @@ Implementação individual de cada motor de reprodução, seguida de validação
 - [x] Iniciar a implementação do primeiro motor (Sugerido: **CDG Engine** por ser a base do karaokê).
 - [x] Configurar a estrutura básica do projeto Tauri/Rust.
 - [x] Criar testes unitários para a decodificação de bytes do CDG.
-- [ ] Criar a renderização visual do formato CDG na interface Web (via WebGL ou Canvas).
-- [ ] Integrar a reprodução de áudio associada (`rodio`) e criar o laço de sincronização de tempo para as instruções CDG.
+- [x] Criar a renderização visual do formato CDG na interface Web via manipulação direta de Canvas ImageData.
+- [x] Integrar a reprodução de áudio associada (`rodio`) e criar o laço de sincronização Master Clock no Rust.
+- [ ] Iniciar a pesquisa para o próximo motor ou funcionalidade de biblioteca.

@@ -9,8 +9,9 @@ Esta matriz define os motores de renderização e reprodução necessários para
 
 ## 2. CDG Engine (Gráficos CDG)
 *   **Formatos:** `.cdg` + (`.mp3`, `.wav`, `.ogg`, `.flac`)
-*   **Tecnologia:** Parser de bytes CDG + `rodio` (Áudio) + Canvas/WebGL (Gráficos)
+*   **Tecnologia:** Parser de bytes CDG + `rodio` (Áudio) + Canvas Direct Pixel Manipulation (Gráficos) + Tauri IPC Master Clock
 *   **Objetivo:** Renderizar os pacotes de desenho do padrão CD Graphics em sincronia com o arquivo de áudio.
+*   **Status:** ✅ **Concluído e Integrado** (Lê bytes, gera cores XOR, renderiza ImageData via IPC React a ~60FPS).
 
 ## 3. Video Engine (Vídeo e Legendas)
 *   **Formatos:** `.mp4`, `.mkv`, `.avi` + (`.lrc`, `.ass`, `.ssa`)
