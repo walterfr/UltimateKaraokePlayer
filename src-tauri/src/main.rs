@@ -1,6 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod cdg_parser;
+mod synth_engine;
+mod video_engine;
+mod tracker_engine;
+mod legacy_engine;
+mod ultrastar_engine;
+mod library;
+mod remote;
 
 use std::sync::mpsc;
 use std::thread;
@@ -10,14 +17,112 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 use std::io::BufReader;
+use rodio::Source;
 
 use crate::cdg_parser::{CdgParser, CdgCommand};
+use crate::synth_engine::{SynthParser, SynthMetadata};
+use crate::video_engine::{VideoEngine, VideoMetadata};
+use crate::tracker_engine::{TrackerParser, TrackerMetadata};
+use crate::legacy_engine::{LegacyParser, LegacyMetadata};
+use crate::ultrastar_engine::{UltrastarParser, UltrastarMetadata};
+use crate::library::Library;
+use crate::library::{SongEntry, QueueEntry};
+use rustysynth::{Synthesizer, SynthesizerSettings, SoundFont, MidiFile, MidiFileSequencer};
+
+struct MidiSource {
+    sequencer: MidiFileSequencer,
+    left_buf: Vec<f32>,
+    right_buf: Vec<f32>,
+    buf_idx: usize,
+    debug_printed: bool,
+    zero_count: usize,
+}
+
+impl MidiSource {
+    fn new(midi_path: &str, sf2_path: &str) -> Result<Self, String> {
+        let mut sf2 = std::fs::File::open(sf2_path).map_err(|e| format!("SF2 error: {}", e))?;
+        let sound_font = Arc::new(SoundFont::new(&mut sf2).map_err(|e| format!("SF2 parse error: {}", e))?);
+        let settings = SynthesizerSettings::new(44100);
+        let synthesizer = Synthesizer::new(&sound_font, &settings).map_err(|e| format!("Synth error: {}", e))?;
+        
+        let mut mid_file = std::fs::File::open(midi_path).map_err(|e| format!("MIDI error: {}", e))?;
+        let midi_data = Arc::new(MidiFile::new(&mut mid_file).map_err(|e| format!("MIDI parse error: {}", e))?);
+        
+        let mut sequencer = MidiFileSequencer::new(synthesizer);
+        sequencer.play(&midi_data, false);
+        
+        Ok(Self {
+            sequencer,
+            left_buf: vec![0.0; 1024],
+            right_buf: vec![0.0; 1024],
+            buf_idx: 1024 * 2, // force initial render
+            debug_printed: false,
+            zero_count: 0,
+        })
+    }
+}
+
+impl Iterator for MidiSource {
+    type Item = i16;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buf_idx >= self.left_buf.len() * 2 {
+            self.sequencer.render(&mut self.left_buf, &mut self.right_buf);
+            self.buf_idx = 0;
+            
+            if !self.debug_printed {
+                // Check if buffer is all zeros
+                let mut all_zeros = true;
+                let mut max_val = 0.0f32;
+                for &v in &self.left_buf {
+                    if v.abs() > max_val { max_val = v.abs(); }
+                    if v != 0.0 { all_zeros = false; }
+                }
+                
+                if all_zeros {
+                    self.zero_count += 1;
+                    if self.zero_count % 100 == 0 {
+                        println!("[MIDI DEBUG] 100 blocos renderizados com ZEROS totais...");
+                    }
+                } else {
+                    println!("[MIDI DEBUG] Áudio não é zero! Valor máximo no bloco: {}", max_val);
+                    self.debug_printed = true;
+                }
+            }
+            
+            if self.sequencer.end_of_sequence() {
+                println!("[MIDI DEBUG] end_of_sequence atingido!");
+                return None;
+            }
+        }
+        
+        let sample = if self.buf_idx % 2 == 0 {
+            self.left_buf[self.buf_idx / 2]
+        } else {
+            self.right_buf[self.buf_idx / 2]
+        };
+        
+        self.buf_idx += 1;
+        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+        Some(s)
+    }
+}
+
+impl rodio::Source for MidiSource {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { 2 }
+    fn sample_rate(&self) -> u32 { 44100 }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
 
 // Enum de comandos para comunicar de forma segura com a thread de áudio nativa
 enum AudioCommand {
     Play(String),
-    #[allow(dead_code)]
+    Pause,
+    Resume,
     Stop,
+    SetVolume(f32),
+    Seek(f64),
+    SetOutputDevice(String),
 }
 
 // O AudioEngine atua como uma casca sobre o transmissor para a thread do Rodio
@@ -25,37 +130,279 @@ struct AudioEngine {
     tx: mpsc::Sender<AudioCommand>,
 }
 
+/// Busca o arquivo SF2 em vários diretórios possíveis
+fn find_sf2() -> Option<std::path::PathBuf> {
+    let candidates = vec![
+        // 1. Ao lado do executável (produção e dev)
+        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("TimGM6mb.sf2"))),
+        // 2. Pasta src-tauri (onde o arquivo realmente está)
+        std::env::current_exe().ok().and_then(|p| {
+            p.parent()
+                .and_then(|d| d.parent()) // target
+                .and_then(|d| d.parent()) // src-tauri
+                .map(|d| d.join("TimGM6mb.sf2"))
+        }),
+        // 3. current_dir (pode funcionar em alguns cenários)
+        std::env::current_dir().ok().map(|d| d.join("TimGM6mb.sf2")),
+        // 4. current_dir/src-tauri
+        std::env::current_dir().ok().map(|d| d.join("src-tauri").join("TimGM6mb.sf2")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        println!("[MIDI] Tentando SF2: {:?} -> exists={}", candidate, candidate.exists());
+        if candidate.exists() {
+            println!("[MIDI] ✓ SF2 encontrado: {:?}", candidate);
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 impl AudioEngine {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         
         // Dispara uma thread nativa persistente para segurar o contexto do Rodio
-        // Isso burla o fato de que o OutputStream do rodio não é thread-safe (não implementa Send).
         thread::spawn(move || {
-            let (_stream, stream_handle) = rodio::OutputStream::try_default()
-                .expect("Failed to get default audio output stream");
+            use cpal::traits::{HostTrait, DeviceTrait};
             
-            let sink = rodio::Sink::try_new(&stream_handle).expect("Failed to create audio sink");
+            let host = cpal::default_host();
+            
+            // Estado mutável: stream + handle + sink + nome do device atual
+            let mut current_stream: Option<rodio::OutputStream> = None;
+            let mut current_handle: Option<rodio::OutputStreamHandle> = None;
+            let mut sink: Option<rodio::Sink> = None;
+            let mut current_volume: f32 = 1.0;
+            let mut current_path: Option<String> = None;
+            let mut is_midi: bool = false;
+            
+            // Inicializa com o device padrão
+            match rodio::OutputStream::try_default() {
+                Ok((stream, handle)) => {
+                    current_stream = Some(stream);
+                    current_handle = Some(handle);
+                    println!("[AUDIO] Inicializado com dispositivo padrão");
+                }
+                Err(e) => eprintln!("[AUDIO] Erro ao abrir dispositivo padrão: {}", e),
+            }
             
             // Fica bloqueado consumindo comandos (MPSC Rx)
             for cmd in rx {
                 match cmd {
-                    AudioCommand::Play(path) => {
-                        println!("AudioEngine (Thread): Iniciando reprodução -> {}", path);
-                        if let Ok(file) = std::fs::File::open(&path) {
-                            if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
-                                sink.stop(); // Interrompe música anterior se houver
-                                sink.append(source);
-                                sink.play();
-                            } else {
-                                eprintln!("Falha ao decodificar arquivo de áudio: {}", path);
+                    AudioCommand::SetOutputDevice(name) => {
+                        println!("[AUDIO] Trocando output para: {}", name);
+                        
+                        // Para o áudio atual
+                        if let Some(old_sink) = sink.take() {
+                            old_sink.stop();
+                            drop(old_sink);
+                        }
+                        drop(current_handle.take());
+                        drop(current_stream.take());
+                        
+                        // Se contém "(Padrão)", usa o dispositivo padrão
+                        if name.contains("(Padrão)") {
+                            match rodio::OutputStream::try_default() {
+                                Ok((stream, handle)) => {
+                                    current_stream = Some(stream);
+                                    current_handle = Some(handle);
+                                    println!("[AUDIO] ✓ Trocado para dispositivo padrão");
+                                }
+                                Err(e) => eprintln!("[AUDIO] Erro: {}", e),
                             }
                         } else {
-                            eprintln!("Falha ao abrir arquivo de áudio: {}", path);
+                            // Busca o dispositivo pelo nome
+                            let found = host.output_devices().ok().and_then(|devices| {
+                                devices.into_iter().find(|d| {
+                                    d.name().map(|n| n == name).unwrap_or(false)
+                                })
+                            });
+                            
+                            match found {
+                                Some(device) => {
+                                    match rodio::OutputStream::try_from_device(&device) {
+                                        Ok((stream, handle)) => {
+                                            current_stream = Some(stream);
+                                            current_handle = Some(handle);
+                                            println!("[AUDIO] ✓ Trocado para: {}", name);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[AUDIO] Erro ao abrir '{}': {}. Voltando ao padrão.", name, e);
+                                            if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+                                                current_stream = Some(stream);
+                                                current_handle = Some(handle);
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {
+                                    eprintln!("[AUDIO] Dispositivo '{}' não encontrado. Mantendo padrão.", name);
+                                    if current_handle.is_none() {
+                                        if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+                                            current_stream = Some(stream);
+                                            current_handle = Some(handle);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
+                    AudioCommand::Play(path) => {
+                        println!("AudioEngine (Thread): Iniciando reprodução -> {}", path);
+                        
+                        // Destroi o sink anterior completamente
+                        if let Some(old_sink) = sink.take() {
+                            old_sink.stop();
+                            drop(old_sink);
+                        }
+                        
+                        let handle_ref = match current_handle {
+                            Some(ref h) => h,
+                            None => {
+                                eprintln!("[AUDIO] Nenhum dispositivo de saída disponível!");
+                                continue;
+                            }
+                        };
+                        
+                        // Cria um novo sink fresco
+                        let new_sink = match rodio::Sink::try_new(handle_ref) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("[AUDIO] Erro ao criar novo Sink: {}", e);
+                                continue;
+                            }
+                        };
+                        new_sink.set_volume(current_volume);
+                        
+                        let ext = path.split('.').last().unwrap_or("").to_lowercase();
+                        is_midi = ext == "mid" || ext == "kar";
+                        
+                        if is_midi {
+                            match find_sf2() {
+                                Some(sf2_path) => {
+                                    let sf2_str = sf2_path.to_string_lossy().to_string();
+                                    println!("[MIDI] Criando MidiSource com SF2={}", sf2_str);
+                                    match MidiSource::new(&path, &sf2_str) {
+                                        Ok(source) => {
+                                            println!("[MIDI] MidiSource criado com sucesso!");
+                                            new_sink.append(source);
+                                            new_sink.play();
+                                            println!("[MIDI] Sink: volume={}, empty={}, paused={}", 
+                                                new_sink.volume(), new_sink.empty(), new_sink.is_paused());
+                                        }
+                                        Err(e) => eprintln!("[MIDI] Erro no MidiSource: {}", e),
+                                    }
+                                }
+                                None => {
+                                    eprintln!("[MIDI] ERRO FATAL: Arquivo TimGM6mb.sf2 não encontrado em nenhum diretório!");
+                                }
+                            }
+                        } else {
+                            if let Ok(file) = std::fs::File::open(&path) {
+                                if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
+                                    new_sink.append(source);
+                                    new_sink.play();
+                                } else {
+                                    eprintln!("Falha ao decodificar arquivo de áudio: {}", path);
+                                }
+                            } else {
+                                eprintln!("Falha ao abrir arquivo de áudio: {}", path);
+                            }
+                        }
+                        
+                        current_path = Some(path);
+                        sink = Some(new_sink);
+                    }
+                    AudioCommand::Pause => {
+                        if let Some(ref s) = sink { s.pause(); }
+                    }
+                    AudioCommand::Resume => {
+                        if let Some(ref s) = sink { s.play(); }
+                    }
                     AudioCommand::Stop => {
-                        sink.stop();
+                        if let Some(old_sink) = sink.take() {
+                            old_sink.stop();
+                            drop(old_sink);
+                        }
+                        current_path = None;
+                        is_midi = false;
+                    }
+                    AudioCommand::SetVolume(vol) => {
+                        current_volume = vol;
+                        if let Some(ref s) = sink { s.set_volume(vol); }
+                    }
+                    AudioCommand::Seek(pos) => {
+                        if is_midi {
+                            // MIDI seek: recria o MidiSource e avança o sequencer renderizando silenciosamente
+                            if let Some(ref path) = current_path {
+                                if let Some(old_sink) = sink.take() {
+                                    old_sink.stop();
+                                    drop(old_sink);
+                                }
+                                
+                                let handle_ref = match current_handle {
+                                    Some(ref h) => h,
+                                    None => continue,
+                                };
+                                let new_sink = match rodio::Sink::try_new(handle_ref) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                new_sink.set_volume(current_volume);
+                                
+                                if let Some(sf2_path) = find_sf2() {
+                                    let sf2_str = sf2_path.to_string_lossy().to_string();
+                                    if let Ok(mut source) = MidiSource::new(path, &sf2_str) {
+                                        // Avança o sequencer renderizando em silêncio até a posição desejada
+                                        let samples_to_skip = (pos * 44100.0) as usize;
+                                        let mut skipped = 0usize;
+                                        let buf_size = source.left_buf.len();
+                                        while skipped < samples_to_skip && !source.sequencer.end_of_sequence() {
+                                            source.sequencer.render(&mut source.left_buf, &mut source.right_buf);
+                                            skipped += buf_size;
+                                        }
+                                        source.buf_idx = buf_size * 2; // force fresh render on next sample
+                                        source.debug_printed = true; // skip debug prints
+                                        
+                                        println!("[MIDI SEEK] Avançou para {}s (skipped {} samples)", pos, skipped);
+                                        new_sink.append(source);
+                                        new_sink.play();
+                                    }
+                                }
+                                
+                                sink = Some(new_sink);
+                            }
+                        } else {
+                            // Áudio normal: recria o decoder e pula amostras
+                            if let Some(ref path) = current_path {
+                                if let Some(old_sink) = sink.take() {
+                                    old_sink.stop();
+                                    drop(old_sink);
+                                }
+                                
+                                let handle_ref = match current_handle {
+                                    Some(ref h) => h,
+                                    None => continue,
+                                };
+                                let new_sink = match rodio::Sink::try_new(handle_ref) {
+                                    Ok(s) => s,
+                                    Err(_) => continue,
+                                };
+                                new_sink.set_volume(current_volume);
+                                
+                                if let Ok(file) = std::fs::File::open(path) {
+                                    if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
+                                        let skip_dur = Duration::from_secs_f64(pos);
+                                        let skipped = source.skip_duration(skip_dur);
+                                        new_sink.append(skipped);
+                                        new_sink.play();
+                                        println!("[AUDIO SEEK] Posição: {}s", pos);
+                                    }
+                                }
+                                
+                                sink = Some(new_sink);
+                            }
+                        }
                     }
                 }
             }
@@ -67,16 +414,46 @@ impl AudioEngine {
     fn play_song(&self, path: String) {
         let _ = self.tx.send(AudioCommand::Play(path));
     }
+
+    fn pause(&self) {
+        let _ = self.tx.send(AudioCommand::Pause);
+    }
+
+    fn resume(&self) {
+        let _ = self.tx.send(AudioCommand::Resume);
+    }
+
+    fn stop(&self) {
+        let _ = self.tx.send(AudioCommand::Stop);
+    }
+
+    fn set_volume(&self, vol: f32) {
+        let _ = self.tx.send(AudioCommand::SetVolume(vol));
+    }
+
+    fn seek_to(&self, pos: f64) {
+        let _ = self.tx.send(AudioCommand::Seek(pos));
+    }
+
+    fn set_output_device(&self, name: String) {
+        let _ = self.tx.send(AudioCommand::SetOutputDevice(name));
+    }
 }
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Estado compartilhado gerenciado pelo Tauri (async Mutex)
 struct AppState {
     audio_engine: Arc<Mutex<AudioEngine>>,
+    library: Arc<Mutex<Library>>,
+    current_song_id: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, serde::Serialize)]
 struct CdgBatchPayload {
     commands: Vec<CdgCommand>,
+    current_time: f64,
+    total_duration: f64,
 }
 
 #[tauri::command]
@@ -85,63 +462,118 @@ async fn play_song(window: tauri::Window, state: tauri::State<'_, AppState>, pat
     let engine = state.audio_engine.lock().await;
     engine.play_song(path.clone());
     
-    // 2. Tenta carregar os pacotes gráficos CD+G correspondentes
-    let cdg_path = path.replace(".mp3", ".cdg").replace(".wav", ".cdg");
+    // Incrementa e captura o ID da música atual para cancelamento
+    let song_id = state.current_song_id.fetch_add(1, Ordering::SeqCst) + 1;
+    let song_id_tracker = state.current_song_id.clone();
     
-    let commands = if let Ok(data) = fs::read(&cdg_path) {
+    // Marca o instante exato em que o áudio começou
+    let start_time = Instant::now();
+
+    // 2. Tenta carregar os pacotes gráficos CD+G correspondentes
+    let cdg_path = path
+        .rsplit_once('.')
+        .map(|(base, _)| format!("{}.cdg", base))
+        .unwrap_or_default();
+
+    let (commands, total_packets) = if let Ok(data) = fs::read(&cdg_path) {
         let parser = CdgParser::new();
-        parser.parse_file(&data)
+        let parsed = parser.parse_file_with_indices(&data);
+        let total = data.len() / 24;
+        println!("CDG file found: {} ({} packets, {} commands)", cdg_path, total, parsed.len());
+        (parsed, total)
     } else {
         println!("CDG file not found at {}, generating mock stream for UI test.", cdg_path);
-        vec![
-            CdgCommand::LoadColorTableLow { colors: [1056, 4000, 255, 0, 0, 0, 0, 0] },
-            CdgCommand::MemoryPreset { color: 0, repeat: 0 },
-            CdgCommand::TileBlockNormal { color0: 0, color1: 1, row: 8, col: 20, pixels: [0x3F, 0x21, 0x21, 0x21, 0x3F, 0, 0, 0, 0, 0, 0, 0] },
-            CdgCommand::TileBlockNormal { color0: 0, color1: 2, row: 8, col: 21, pixels: [0x3F, 0x21, 0x21, 0x21, 0x3F, 0, 0, 0, 0, 0, 0, 0] },
-            CdgCommand::TileBlockXor { color0: 0, color1: 1, row: 8, col: 22, pixels: [0x1E, 0x21, 0x21, 0x1E, 0x01, 0x01, 0x1E, 0, 0, 0, 0, 0] }
-        ]
+        (vec![
+            (0, CdgCommand::LoadColorTableLow { colors: [1056, 4000, 255, 0, 0, 0, 0, 0] }),
+            (1, CdgCommand::MemoryPreset { color: 0, repeat: 0 }),
+            (2, CdgCommand::TileBlockNormal { color0: 0, color1: 1, row: 8, col: 20, pixels: [0x3F, 0x21, 0x21, 0x21, 0x3F, 0, 0, 0, 0, 0, 0, 0] }),
+            (3, CdgCommand::TileBlockNormal { color0: 0, color1: 2, row: 8, col: 21, pixels: [0x3F, 0x21, 0x21, 0x21, 0x3F, 0, 0, 0, 0, 0, 0, 0] }),
+            (4, CdgCommand::TileBlockXor { color0: 0, color1: 1, row: 8, col: 22, pixels: [0x1E, 0x21, 0x21, 0x1E, 0x01, 0x01, 0x1E, 0, 0, 0, 0, 0] }),
+        ], 300 * 30)
     };
 
-    let total_commands = commands.len();
+    let total_duration = total_packets as f64 / 300.0;
     
     // 3. MASTER CLOCK (Thread de Streaming e Sincronização Assíncrona)
     tokio::spawn(async move {
-        // Taxa do CDG: Oficialmente 300 pacotes por segundo exatos.
+        // Aguarda meio segundo para garantir que o componente React <CdgCanvas /> foi montado e registrou o `listen` IPC
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
         const PACKETS_PER_SEC: f64 = 300.0;
-        let start_time = Instant::now();
-        let mut interval = tokio::time::interval(Duration::from_millis(16)); // Poll de ~60Hz
-        
-        let mut last_processed_index = 0;
+        let mut interval = tokio::time::interval(Duration::from_millis(16));
+        let mut last_sent_idx: i64 = -1;
 
         loop {
-            interval.tick().await; // Aguarda o próximo quadro gráfico
-            
-            // Relógio Matemático: calcula o exato milissegundo em que estamos e traduz para índice de pacote
+            // Verifica se o usuário apertou Stop ou deu Play em outra música
+            if song_id_tracker.load(Ordering::SeqCst) != song_id {
+                println!("Master clock abortado (nova música ou stop).");
+                break;
+            }
+
+            interval.tick().await;
+            // O elapsed() compensa o sleep de 500ms porque o start_time foi marcado ANTES do sleep!
             let elapsed_secs = start_time.elapsed().as_secs_f64();
-            let target_index = (elapsed_secs * PACKETS_PER_SEC) as usize;
-            
-            if target_index > last_processed_index {
-                let end_index = target_index.min(total_commands);
-                if end_index > last_processed_index {
-                    // Extrai apenas os pacotes correspondentes ao delta de tempo
-                    let batch = commands[last_processed_index..end_index].to_vec();
-                    
-                    if let Err(e) = window.emit("cdg_batch", CdgBatchPayload { commands: batch }) {
+            let target_packet = (elapsed_secs * PACKETS_PER_SEC) as i64;
+
+            if target_packet > last_sent_idx {
+                let mut batch = Vec::new();
+                for (packet_idx, cmd) in &commands {
+                    let p = *packet_idx as i64;
+                    if p > last_sent_idx && p <= target_packet {
+                        batch.push(cmd.clone());
+                    }
+                }
+                if !batch.is_empty() {
+                    if let Err(e) = window.emit("cdg_batch", CdgBatchPayload {
+                        commands: batch,
+                        current_time: elapsed_secs,
+                        total_duration,
+                    }) {
                         eprintln!("Error emitting CDG batch: {}", e);
                         break;
                     }
-                    
-                    last_processed_index = end_index;
                 }
+                last_sent_idx = target_packet;
             }
 
-            if last_processed_index >= total_commands {
+            if last_sent_idx >= total_packets as i64 {
                 println!("Fim da reprodução do CDG stream.");
-                break; // Músic/Stream acabou
+                break;
             }
         }
     });
 
+    Ok(())
+}
+
+#[tauri::command]
+async fn pause_audio(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.audio_engine.lock().await.pause();
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_audio(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.audio_engine.lock().await.resume();
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_audio(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.current_song_id.fetch_add(1, Ordering::SeqCst);
+    state.audio_engine.lock().await.stop();
+    Ok(())
+}
+
+#[tauri::command]
+async fn set_volume(state: tauri::State<'_, AppState>, volume: f32) -> Result<(), String> {
+    state.audio_engine.lock().await.set_volume(volume);
+    Ok(())
+}
+
+#[tauri::command]
+async fn seek_to(state: tauri::State<'_, AppState>, position: f64) -> Result<(), String> {
+    state.audio_engine.lock().await.seek_to(position);
     Ok(())
 }
 
@@ -152,12 +584,185 @@ async fn parse_cdg_file(path: String) -> Result<Vec<CdgCommand>, String> {
     Ok(parser.parse_file(&data))
 }
 
+#[tauri::command]
+async fn parse_midi_file(path: String) -> Result<SynthMetadata, String> {
+    SynthParser::parse_file(&path)
+}
+
+#[tauri::command]
+async fn parse_video_file(path: String) -> Result<VideoMetadata, String> {
+    VideoEngine::parse_subtitles(&path)
+}
+
+#[tauri::command]
+async fn parse_tracker_file(path: String) -> Result<TrackerMetadata, String> {
+    TrackerParser::parse_file(&path)
+}
+
+#[tauri::command]
+async fn parse_legacy_file(path: String) -> Result<LegacyMetadata, String> {
+    LegacyParser::parse_file(&path)
+}
+
+#[tauri::command]
+async fn parse_ultrastar_file(path: String) -> Result<UltrastarMetadata, String> {
+    UltrastarParser::parse_file(&path)
+}
+
+// Library commands
+
+
+#[tauri::command]
+async fn scan_library(state: tauri::State<'_, AppState>, path: String, engine: Option<String>) -> Result<serde_json::Value, String> {
+    let lib = state.library.lock().await;
+    match lib.scan_directory(&path, engine).await {
+        Ok(count) => Ok(serde_json::json!({ "count": count })),
+        Err(e) => Err(e),
+    }
+}
+
+#[tauri::command]
+async fn search_songs(state: tauri::State<'_, AppState>, query: String, sort_by: Option<String>) -> Result<Vec<SongEntry>, String> {
+    let lib = state.library.lock().await;
+    let sort = sort_by.unwrap_or_else(|| "title".to_string());
+    lib.search_songs(&query, &sort).await
+}
+
+#[tauri::command]
+async fn enqueue_song(state: tauri::State<'_, AppState>, song_id: i64, requested_by: String) -> Result<i64, String> {
+    let lib = state.library.lock().await;
+    lib.enqueue(song_id, &requested_by).await
+}
+
+#[tauri::command]
+async fn get_queue(state: tauri::State<'_, AppState>) -> Result<Vec<QueueEntry>, String> {
+    let lib = state.library.lock().await;
+    lib.get_queue().await
+}
+
+#[tauri::command]
+async fn remove_from_queue(state: tauri::State<'_, AppState>, queue_id: i64) -> Result<(), String> {
+    let lib = state.library.lock().await;
+    lib.remove_from_queue(queue_id).await
+}
+
+#[tauri::command]
+async fn clear_library(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let lib = state.library.lock().await;
+    lib.clear_library().await
+}
+
+#[tauri::command]
+async fn clear_queue(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let lib = state.library.lock().await;
+    lib.clear_queue().await
+}
+
+#[tauri::command]
+async fn save_setting(state: tauri::State<'_, AppState>, key: String, value: String) -> Result<(), String> {
+    let lib = state.library.lock().await;
+    lib.save_setting(&key, &value).await
+}
+
+#[tauri::command]
+async fn get_all_settings(state: tauri::State<'_, AppState>) -> Result<std::collections::HashMap<String, String>, String> {
+    let lib = state.library.lock().await;
+    lib.get_all_settings().await
+}
+
+#[tauri::command]
+async fn get_songs_count(state: tauri::State<'_, AppState>) -> Result<i64, String> {
+    let lib = state.library.lock().await;
+    lib.get_songs_count().await
+}
+
+#[tauri::command]
+fn list_output_devices() -> Result<Vec<String>, String> {
+    use cpal::traits::{HostTrait, DeviceTrait};
+    let host = cpal::default_host();
+    let mut names = Vec::new();
+    
+    // Add default device first
+    if let Some(default) = host.default_output_device() {
+        if let Ok(name) = default.name() {
+            names.push(format!("⭐ {} (Padrão)", name));
+        }
+    }
+    
+    // Add all other devices
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            if let Ok(name) = device.name() {
+                if !names.iter().any(|n: &String| n.contains(&name)) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    
+    Ok(names)
+}
+
+#[tauri::command]
+async fn set_output_device(state: tauri::State<'_, AppState>, device_name: String) -> Result<(), String> {
+    let engine = state.audio_engine.lock().await;
+    engine.set_output_device(device_name);
+    Ok(())
+}
+
 fn main() {
+    let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
+
+    // Usar diretório fora de src-tauri/ para evitar que o watcher do Tauri
+    // reinicie o app toda vez que o banco de dados for escrito durante o scan.
+    let db_path = {
+        let mut path = std::env::temp_dir();
+        path.push("ultimate_karaoke_player");
+        std::fs::create_dir_all(&path).ok();
+        path.push("karaoke.db");
+        format!("sqlite:{}?mode=rwc", path.display())
+    };
+
+    println!("[DB] Usando banco de dados em: {}", db_path);
+
+    let library = rt.block_on(async {
+        Library::new(&db_path).await
+            .expect("Failed to initialize library database")
+    });
+
+    let library_arc = Arc::new(Mutex::new(library));
+
     tauri::Builder::default()
+        .setup({
+            let library_arc = library_arc.clone();
+            move |app| {
+                let handle = app.handle();
+                let state = remote::RemoteState {
+                    library: library_arc,
+                    app_handle: handle,
+                };
+                
+                tauri::async_runtime::spawn(async move {
+                    remote::start_server(state).await;
+                });
+                
+                Ok(())
+            }
+        })
         .manage(AppState {
             audio_engine: Arc::new(Mutex::new(AudioEngine::new())),
+            library: library_arc,
+            current_song_id: Arc::new(AtomicUsize::new(0)),
         })
-        .invoke_handler(tauri::generate_handler![play_song, parse_cdg_file])
+        .invoke_handler(tauri::generate_handler![
+            play_song, parse_cdg_file, parse_midi_file, parse_video_file,
+            parse_tracker_file, parse_legacy_file, parse_ultrastar_file,
+            stop_audio, pause_audio, resume_audio, set_volume, seek_to,
+            scan_library, search_songs, get_songs_count, clear_library,
+            enqueue_song, get_queue, remove_from_queue, clear_queue,
+            save_setting, get_all_settings,
+            list_output_devices, set_output_device
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

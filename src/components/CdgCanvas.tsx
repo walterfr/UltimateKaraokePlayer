@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
 
 export type CdgCommand = 
@@ -12,25 +12,20 @@ export type CdgCommand =
   | { type: 'LoadColorTableHigh', data: { colors: number[] } }
   | { type: 'TileBlockXor', data: { color0: number, color1: number, row: number, col: number, pixels: number[] } };
 
-interface CdgCanvasProps {}
-
 const CDG_WIDTH = 300;
 const CDG_HEIGHT = 216;
 
-const CdgCanvas: React.FC<CdgCanvasProps> = () => {
+const CdgCanvas: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  
-  // State refs to persist between renders without causing React re-renders
   const colorIndexBufferRef = useRef<Uint8Array>(new Uint8Array(CDG_WIDTH * CDG_HEIGHT));
-  // Palette in ABGR format (for direct Uint32Array assignment into ImageData)
   const paletteRef = useRef<Uint32Array>(new Uint32Array(16));
-  
+  const [progress, setProgress] = useState({ current: 0, total: 0 });
+
   useEffect(() => {
-    // Inicializa a paleta padrão (preto) com alpha total
-    for(let i=0; i<16; i++) {
-        if (paletteRef.current[i] === 0) {
-            paletteRef.current[i] = 0xFF000000;
-        }
+    for (let i = 0; i < 16; i++) {
+      if (paletteRef.current[i] === 0) {
+        paletteRef.current[i] = 0xFF000000;
+      }
     }
   }, []);
 
@@ -43,32 +38,35 @@ const CdgCanvas: React.FC<CdgCanvasProps> = () => {
     const indexBuffer = colorIndexBufferRef.current;
     const palette = paletteRef.current;
 
-    // Converte de 12-bit RGB para 32-bit ABGR
     const setPaletteColor = (index: number, rgb12: number) => {
       const r = (rgb12 >> 8) & 0x0F;
       const g = (rgb12 >> 4) & 0x0F;
       const b = rgb12 & 0x0F;
-      
-      const r8 = r * 17;
-      const g8 = g * 17;
-      const b8 = b * 17;
-      
-      // A=0xFF (255) | B | G | R
-      palette[index] = 0xFF000000 | (b8 << 16) | (g8 << 8) | r8;
+      palette[index] = 0xFF000000 | ((b * 17) << 16) | ((g * 17) << 8) | (r * 17);
     };
 
-    let unlistenFn: () => void;
+    const render = () => {
+      const imageData = ctx.createImageData(CDG_WIDTH, CDG_HEIGHT);
+      const data32 = new Uint32Array(imageData.data.buffer);
+      for (let i = 0; i < indexBuffer.length; i++) {
+        data32[i] = palette[indexBuffer[i]];
+      }
+      ctx.putImageData(imageData, 0, 0);
+    };
 
-    // Escuta batches do backend via Tauri Events
-    listen<{ commands: CdgCommand[] }>('cdg_batch', (event) => {
+    let unlisten: (() => void) | undefined;
+    let isCancelled = false;
+
+    listen<{ commands: CdgCommand[]; current_time: number; total_duration: number }>('cdg_batch', (event) => {
       let needsRedraw = false;
-      const commands = event.payload.commands;
+      const types = event.payload.commands.map(c => c.type);
+      if (types.length > 0) console.log('[CDG] batch:', types);
+      setProgress({ current: event.payload.current_time, total: event.payload.total_duration });
 
-      commands.forEach(cmd => {
+      for (const cmd of event.payload.commands) {
         switch (cmd.type) {
           case 'MemoryPreset': {
-            const color = cmd.data.color;
-            indexBuffer.fill(color);
+            indexBuffer.fill(cmd.data.color);
             needsRedraw = true;
             break;
           }
@@ -84,81 +82,120 @@ const CdgCanvas: React.FC<CdgCanvasProps> = () => {
             needsRedraw = true;
             break;
           }
-          case 'LoadColorTableLow': {
-            cmd.data.colors.forEach((c, i) => setPaletteColor(i, c));
-            needsRedraw = true; // Força re-draw na mudança de paleta
+          case 'ScrollPreset':
+          case 'ScrollCopy': {
+            const { h_cmd, v_cmd } = cmd.data;
+            let h_shift = 0;
+            if (h_cmd === 1) h_shift = 6;
+            else if (h_cmd === 2) h_shift = -6;
+
+            let v_shift = 0;
+            if (v_cmd === 1) v_shift = 12;
+            else if (v_cmd === 2) v_shift = -12;
+
+            if (h_shift !== 0 || v_shift !== 0) {
+              const newBuffer = new Uint8Array(CDG_WIDTH * CDG_HEIGHT);
+              const isCopy = cmd.type === 'ScrollCopy';
+              const bgColor = cmd.type === 'ScrollPreset' ? cmd.data.color : 0;
+
+              for (let y = 0; y < CDG_HEIGHT; y++) {
+                for (let x = 0; x < CDG_WIDTH; x++) {
+                  let srcX = x - h_shift;
+                  let srcY = y - v_shift;
+                  
+                  if (isCopy) {
+                    if (srcX < 0) srcX += CDG_WIDTH;
+                    else if (srcX >= CDG_WIDTH) srcX -= CDG_WIDTH;
+                    if (srcY < 0) srcY += CDG_HEIGHT;
+                    else if (srcY >= CDG_HEIGHT) srcY -= CDG_HEIGHT;
+                    newBuffer[y * CDG_WIDTH + x] = indexBuffer[srcY * CDG_WIDTH + srcX];
+                  } else {
+                    if (srcX < 0 || srcX >= CDG_WIDTH || srcY < 0 || srcY >= CDG_HEIGHT) {
+                      newBuffer[y * CDG_WIDTH + x] = bgColor;
+                    } else {
+                      newBuffer[y * CDG_WIDTH + x] = indexBuffer[srcY * CDG_WIDTH + srcX];
+                    }
+                  }
+                }
+              }
+              indexBuffer.set(newBuffer);
+              needsRedraw = true;
+            }
             break;
           }
-          case 'LoadColorTableHigh': {
+          case 'LoadColorTableLow':
+            cmd.data.colors.forEach((c, i) => setPaletteColor(i, c));
+            needsRedraw = true;
+            break;
+          case 'LoadColorTableHigh':
             cmd.data.colors.forEach((c, i) => setPaletteColor(i + 8, c));
             needsRedraw = true;
             break;
-          }
           case 'TileBlockNormal':
           case 'TileBlockXor': {
             const { color0, color1, row, col, pixels } = cmd.data;
             const startX = col * 6;
             const startY = row * 12;
-            
             if (startX >= CDG_WIDTH || startY >= CDG_HEIGHT) break;
-            
             const isXor = cmd.type === 'TileBlockXor';
-
             for (let py = 0; py < 12; py++) {
-              const pixelRow = pixels[py];
               const actualY = startY + py;
               if (actualY >= CDG_HEIGHT) continue;
-              
+              const pixelRow = pixels[py];
               for (let px = 0; px < 6; px++) {
                 const actualX = startX + px;
                 if (actualX >= CDG_WIDTH) continue;
-                
-                const bit = (pixelRow >> (5 - px)) & 0x01;
-                const colorIndex = bit ? color1 : color0;
-                
+                const bit = (pixelRow >> (5 - px)) & 1;
+                const ci = bit ? color1 : color0;
                 const idx = actualY * CDG_WIDTH + actualX;
-                if (isXor) {
-                  indexBuffer[idx] ^= colorIndex;
-                } else {
-                  indexBuffer[idx] = colorIndex;
-                }
+                indexBuffer[idx] = isXor ? indexBuffer[idx] ^ ci : ci;
               }
             }
             needsRedraw = true;
             break;
           }
         }
-      });
-
-      if (needsRedraw) {
-        const imageData = ctx.createImageData(CDG_WIDTH, CDG_HEIGHT);
-        const data32 = new Uint32Array(imageData.data.buffer);
-        
-        for (let i = 0; i < indexBuffer.length; i++) {
-          data32[i] = palette[indexBuffer[i]];
-        }
-        
-        ctx.putImageData(imageData, 0, 0);
       }
-    }).then(f => unlistenFn = f);
+
+      if (needsRedraw) render();
+    }).then((f) => {
+      if (isCancelled) f();
+      else unlisten = f;
+    });
 
     return () => {
-      if (unlistenFn) unlistenFn();
+      isCancelled = true;
+      if (unlisten) unlisten();
     };
   }, []);
 
+  const fmt = (s: number) => `${Math.floor(s / 60)}:${Math.floor(s % 60).toString().padStart(2, '0')}`;
+
   return (
     <div className="flex flex-col items-center justify-center w-full h-full bg-black overflow-hidden relative">
-      <div className="relative aspect-[300/216] max-h-full max-w-full w-[800px]">
-        <canvas 
-          ref={canvasRef} 
-          width={CDG_WIDTH} 
-          height={CDG_HEIGHT} 
-          className="absolute inset-0 w-full h-full object-contain shadow-[0_0_80px_rgba(0,100,255,0.15)] border-4 border-[#12121a] rounded-lg"
+      <div className="relative w-full max-w-[800px]" style={{ aspectRatio: '300/216' }}>
+        <canvas
+          ref={canvasRef}
+          width={CDG_WIDTH}
+          height={CDG_HEIGHT}
+          className="absolute inset-0 w-full h-full border-2 border-slate-800 rounded-lg"
           style={{ imageRendering: 'pixelated' }}
         />
-        <div className="absolute inset-0 pointer-events-none bg-[url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAACCAYAAACZgbYnAAAAEElEQVQImWNgYGD4z8DAAAAAYAAY09L6LwAAAABJRU5ErkJggg==')] opacity-20 mix-blend-overlay rounded-lg"></div>
       </div>
+      {progress.total > 0 && (
+        <div className="w-full max-w-[800px] px-4 mt-2">
+          <div className="h-1.5 bg-slate-800 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-blue-500 transition-all duration-200 rounded-full"
+              style={{ width: `${(progress.current / progress.total) * 100}%` }}
+            />
+          </div>
+          <div className="flex justify-between text-[10px] text-slate-500 mt-0.5">
+            <span>{fmt(progress.current)}</span>
+            <span>{fmt(progress.total)}</span>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

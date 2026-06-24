@@ -134,6 +134,16 @@ impl CdgParser {
         commands
     }
 
+    pub fn parse_file_with_indices(&self, data: &[u8]) -> Vec<(usize, CdgCommand)> {
+        let mut commands = Vec::new();
+        for (i, chunk) in data.chunks_exact(24).enumerate() {
+            if let Some(cmd) = self.parse_packet(chunk) {
+                commands.push((i, cmd));
+            }
+        }
+        commands
+    }
+
     fn parse_colors(data: &[u8]) -> [u16; 8] {
         let mut colors = [0u16; 8];
         for i in 0..8 {

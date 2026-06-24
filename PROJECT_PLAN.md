@@ -19,31 +19,36 @@ Criar o player de karaokê definitivo com compatibilidade total de formatos, uti
 
 ### Fase 1: Motores de Mídia (Atual)
 Implementação individual de cada motor de reprodução, seguida de validação com arquivos de teste.
-1. [x] CDG Engine (MP3+G) - *Parser, Áudio e Sincronização concluídos com sucesso!*
-2. [ ] Synth Engine (MIDI/KAR)
-3. [ ] Video Engine (MP4/ASS)
-4. [ ] Tracker Engine (ST3/XM)
-5. [ ] Legacy Engine (MK1)
+1. [x] CDG Engine (MP3+G) - *Parser, Áudio e Sincronização concluídos!*
+2. [x] Synth Engine (MIDI/KAR) - *Parser MIDI, extração de letras e renderização concluídos!*
+3. [x] Video Engine (MP4/ASS/LRC/SRT) - *Player nativo + overlay de legendas concluído!*
+4. [x] Ultrastar Engine (TXT+MP3) - *Parser de notas estilo SingStar*
+5. [x] Tracker Engine (MOD/XM/S3M) - *Parser de cabeçalhos e estrutura concluído!*
+6. [x] Legacy Engine (MK1/KARA) - *Parser de cabeçalhos MK1/KARA concluído!*
+
+✅ **Fase 1 completa - todos os 6 motores implementados!**
 
 ### Fase 2: Core do Servidor e Gestão
-- Implementação do banco de dados de músicas.
-- Sistema de indexação de arquivos.
-- API de gerenciamento de fila.
+- [x] Implementação do banco de dados SQLite (schema songs/queue/settings)
+- [x] Sistema de indexação de arquivos (scanner recursivo com auto-detecção de formato)
+- [x] API de gerenciamento de fila (enqueue, remove, reorder, clear) e configurações
+- [x] Comandos Tauri para busca de músicas, ordenação (sort) e fila
+- [x] Interface de biblioteca (busca inteligente + tags + clear/sort) conectada ao BD
+- [x] Interface de fila (enqueue/remove com auto-play e auto-refresh)
+- [ ] Servidor HTTP Axum + WebSocket ← **PRÓXIMO**
 
 ### Fase 3: Interface e Sincronização
-- Desenvolvimento do Player Host no Tauri.
-- Desenvolvimento da Interface de Cliente Web.
-- Sincronização de tempo via WebSockets.
+- [x] Desenvolvimento do Player Host no Tauri (Painel de Configuração de Motores, Queue e Biblioteca centralizada).
+- [ ] Desenvolvimento da Interface de Cliente Web Remoto (Browser de Celular).
+- [ ] Sincronização de estado via WebSockets.
 
 ### Fase 4: Refinamento e Testes
-- Otimização de latência.
-- Testes de estresse com múltiplos clientes.
-- Polimento de UI/UX.
+- [ ] Otimização de latência.
+- [ ] Testes de estresse com múltiplos clientes.
+- [ ] Polimento de UI/UX.
 
 ## 📅 Próximos Passos (Sessão Atual)
-- [x] Iniciar a implementação do primeiro motor (Sugerido: **CDG Engine** por ser a base do karaokê).
-- [x] Configurar a estrutura básica do projeto Tauri/Rust.
-- [x] Criar testes unitários para a decodificação de bytes do CDG.
-- [x] Criar a renderização visual do formato CDG na interface Web via manipulação direta de Canvas ImageData.
-- [x] Integrar a reprodução de áudio associada (`rodio`) e criar o laço de sincronização Master Clock no Rust.
-- [ ] Iniciar a pesquisa para o próximo motor ou funcionalidade de biblioteca.
+- [x] Implementar servidor HTTP Axum para API REST de biblioteca/fila
+- [x] Adicionar suporte WebSocket para sincronização em tempo real
+- [x] Criar interface web para clientes remotos
+- [ ] Finalizar integração de áudio MIDI com fluid-synth
