@@ -83,7 +83,14 @@ const SynthDisplay: React.FC<SynthDisplayProps> = ({ metadata, isPlaying, curren
   const prevLine = currentLineIdx > 0 ? metadata.lyrics[currentLineIdx - 1] : null;
 
   return (
-    <div className="flex flex-col h-full w-full bg-black">
+    <div className="flex flex-col h-full w-full bg-gradient-to-br from-slate-950 via-indigo-950 to-slate-950 relative overflow-hidden">
+      {/* Background ambient lighting */}
+      <div className="absolute inset-0 pointer-events-none opacity-50">
+        <div className="absolute -top-[20%] -left-[10%] w-[60vw] h-[60vw] bg-blue-600/20 rounded-full blur-[120px] mix-blend-screen animate-[pulse_8s_ease-in-out_infinite]" />
+        <div className="absolute -bottom-[20%] -right-[10%] w-[70vw] h-[70vw] bg-purple-600/20 rounded-full blur-[150px] mix-blend-screen animate-[pulse_12s_ease-in-out_infinite_reverse]" />
+      </div>
+      
+      <div className="relative z-10 flex flex-col h-full w-full">
       {/* Cabeçalho */}
       <div className="text-center px-4 py-2 bg-slate-900/70 border-b border-slate-800 shrink-0">
         <h2 className="text-lg font-bold text-white truncate">{metadata.title || 'MIDI/KAR'}</h2>
@@ -142,6 +149,7 @@ const SynthDisplay: React.FC<SynthDisplayProps> = ({ metadata, isPlaying, curren
           className="h-full bg-gradient-to-r from-orange-500 to-yellow-400 transition-all duration-200"
           style={{ width: `${Math.min((currentTime / metadata.total_seconds) * 100, 100)}%` }}
         />
+      </div>
       </div>
     </div>
   );
