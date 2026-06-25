@@ -30,6 +30,8 @@ use crate::ultrastar_engine::{UltrastarParser, UltrastarMetadata};
 use crate::library::Library;
 use crate::library::{SongEntry, QueueEntry};
 use rustysynth::{Synthesizer, SynthesizerSettings, SoundFont, MidiFile, MidiFileSequencer};
+use xmrs::prelude::Module;
+use xmrsplayer::xmrsplayer::XmrsPlayer;
 
 struct MidiSource {
     sequencer: MidiFileSequencer,
@@ -116,6 +118,61 @@ impl rodio::Source for MidiSource {
     fn total_duration(&self) -> Option<Duration> { None }
 }
 
+struct TrackerSource {
+    player: XmrsPlayer<'static>,
+    module_ptr: *mut Module,
+    next_sample: Option<i16>,
+}
+
+unsafe impl Send for TrackerSource {}
+
+impl TrackerSource {
+    fn new(path: &str) -> Result<Self, String> {
+        let data = std::fs::read(path).map_err(|e| format!("IO error: {}", e))?;
+        let module = Module::load(&data).map_err(|e| format!("XMRS error: {:?}", e))?;
+        let boxed_module = Box::new(module);
+        let module_ptr = Box::into_raw(boxed_module);
+        let module_ref: &'static Module = unsafe { &*module_ptr };
+        let player = XmrsPlayer::new(module_ref, 44100, 0);
+        Ok(Self {
+            player,
+            module_ptr,
+            next_sample: None,
+        })
+    }
+}
+
+impl Drop for TrackerSource {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(self.module_ptr);
+        }
+    }
+}
+
+impl Iterator for TrackerSource {
+    type Item = i16;
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(sample) = self.next_sample.take() {
+            return Some(sample);
+        }
+        
+        if let Some((l, r)) = self.player.sample(true) {
+            self.next_sample = Some(r);
+            Some(l)
+        } else {
+            None // end of song
+        }
+    }
+}
+
+impl rodio::Source for TrackerSource {
+    fn current_frame_len(&self) -> Option<usize> { None }
+    fn channels(&self) -> u16 { 2 }
+    fn sample_rate(&self) -> u32 { 44100 }
+    fn total_duration(&self) -> Option<Duration> { None }
+}
+
 // Enum de comandos para comunicar de forma segura com a thread de áudio nativa
 enum AudioCommand {
     Play(String),
@@ -150,6 +207,7 @@ impl AudioEngine {
             let mut current_volume: f32 = 1.0;
             let mut current_path: Option<String> = None;
             let mut is_midi: bool = false;
+            let mut is_tracker: bool = false;
             
             // Inicializa com o device padrão
             match rodio::OutputStream::try_default() {
@@ -251,6 +309,7 @@ impl AudioEngine {
                         
                         let ext = path.split('.').last().unwrap_or("").to_lowercase();
                         is_midi = ext == "mid" || ext == "kar";
+                        is_tracker = ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it";
                         
                         if is_midi {
                             match &sf2_path {
@@ -271,6 +330,16 @@ impl AudioEngine {
                                 None => {
                                     eprintln!("[MIDI] ERRO FATAL: Arquivo TimGM6mb.sf2 não encontrado em nenhum diretório!");
                                 }
+                            }
+                        } else if is_tracker {
+                            println!("[TRACKER] Criando TrackerSource");
+                            match TrackerSource::new(&path) {
+                                Ok(source) => {
+                                    println!("[TRACKER] TrackerSource criado com sucesso!");
+                                    new_sink.append(source);
+                                    new_sink.play();
+                                }
+                                Err(e) => eprintln!("[TRACKER] Erro no TrackerSource: {}", e),
                             }
                         } else {
                             if let Ok(file) = std::fs::File::open(&path) {
@@ -347,6 +416,9 @@ impl AudioEngine {
                                 
                                 sink = Some(new_sink);
                             }
+                        } else if is_tracker {
+                            // TODO: Implement seek for Tracker
+                            println!("[TRACKER SEEK] Seek não implementado ainda.");
                         } else {
                             // Áudio normal: recria o decoder e pula amostras
                             if let Some(ref path) = current_path {
@@ -368,6 +440,8 @@ impl AudioEngine {
                                 if let Ok(file) = std::fs::File::open(path) {
                                     if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
                                         let skip_dur = Duration::from_secs_f64(pos);
+                                        // A trait rodio::Source tem skip_duration
+                                        use rodio::Source;
                                         let skipped = source.skip_duration(skip_dur);
                                         new_sink.append(skipped);
                                         new_sink.play();
