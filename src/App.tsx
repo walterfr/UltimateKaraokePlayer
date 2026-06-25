@@ -480,6 +480,7 @@ const App = () => {
                 isPlaying={isPlaying} 
                 currentTime={currentTimeSec} 
                 micDeviceId={selectedInputDevice}
+                songFilePath={currentFilePath}
               />
             </div>
           )}
@@ -642,7 +643,7 @@ const App = () => {
             }}
           >
             {outputDevices.map((d, i) => (
-              <option key={i} value={d}>{d}</option>
+              <option key={i} value={d.name}>{d.name}</option>
             ))}
           </select>
         </div>

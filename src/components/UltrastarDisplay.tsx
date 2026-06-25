@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { usePitchDetector } from '../hooks/usePitchDetector';
+import { convertFileSrc } from '@tauri-apps/api/tauri';
 
 export interface UltrastarNote {
   note_type: string;
@@ -31,6 +32,7 @@ interface UltrastarDisplayProps {
   isPlaying: boolean;
   currentTime: number;
   micDeviceId?: string;
+  songFilePath?: string;
 }
 
 interface Phrase {
@@ -39,7 +41,7 @@ interface Phrase {
   notes: UltrastarNote[];
 }
 
-const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying, currentTime, micDeviceId }) => {
+const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying, currentTime, micDeviceId, songFilePath }) => {
   if (!metadata) {
     return (
       <div className="flex items-center justify-center h-full text-slate-500">
@@ -51,6 +53,21 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   const beatDuration = metadata.bpm > 0 ? 60.0 / (metadata.bpm * 4.0) : 1.0;
   const gapSeconds = metadata.gap / 1000.0;
   const currentBeat = (currentTime - gapSeconds) / beatDuration;
+
+  const [mediaUrl, setMediaUrl] = useState<{ type: 'video' | 'image', url: string } | null>(null);
+
+  useEffect(() => {
+    if (metadata && songFilePath) {
+      const dir = songFilePath.replace(/\\/g, '/').substring(0, songFilePath.replace(/\\/g, '/').lastIndexOf('/'));
+      if (metadata.video) {
+        setMediaUrl({ type: 'video', url: convertFileSrc(`${dir}/${metadata.video}`) });
+      } else if (metadata.cover) {
+        setMediaUrl({ type: 'image', url: convertFileSrc(`${dir}/${metadata.cover}`) });
+      } else {
+        setMediaUrl(null);
+      }
+    }
+  }, [metadata, songFilePath]);
 
   // 1. Group notes into phrases
   const phrases = useMemo(() => {
@@ -303,6 +320,31 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   return (
     <div className="flex flex-col h-full w-full bg-slate-950 font-sans relative">
       
+      {/* Background Media */}
+      {mediaUrl && (
+        <div className="absolute inset-0 z-0 overflow-hidden bg-black">
+          {mediaUrl.type === 'video' ? (
+            <video 
+              src={mediaUrl.url} 
+              muted 
+              className="w-full h-full object-cover opacity-50"
+              ref={(ref) => {
+                if (ref) {
+                  if (isPlaying && ref.paused) ref.play().catch(()=>{});
+                  if (!isPlaying && !ref.paused) ref.pause();
+                  // Sync if drift > 0.5s
+                  if (Math.abs(ref.currentTime - currentTime) > 0.5) {
+                    ref.currentTime = currentTime;
+                  }
+                }
+              }}
+            />
+          ) : (
+            <img src={mediaUrl.url} alt="Cover" className="w-full h-full object-cover opacity-50" />
+          )}
+        </div>
+      )}
+
       {/* SCORE BOX (Top Right) */}
       <div className="absolute top-4 right-4 z-50 bg-gradient-to-b from-blue-500 to-blue-700 border-2 border-blue-400 rounded-lg shadow-[0_4px_15px_rgba(0,0,0,0.5)] px-6 py-2 flex items-center justify-center">
         <span className="text-white font-black text-3xl tracking-widest drop-shadow-md">
