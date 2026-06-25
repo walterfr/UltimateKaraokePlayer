@@ -48,12 +48,6 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
     );
   }
 
-  const formatTime = (seconds: number): string => {
-    const m = Math.floor(seconds / 60);
-    const s = Math.floor(seconds % 60);
-    return `${m}:${s.toString().padStart(2, '0')}`;
-  };
-
   const beatDuration = metadata.bpm > 0 ? 60.0 / (metadata.bpm * 4.0) : 1.0;
   const gapSeconds = metadata.gap / 1000.0;
   const currentBeat = (currentTime - gapSeconds) / beatDuration;
@@ -89,10 +83,7 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   const activePhraseIdx = useMemo(() => {
     for (let i = 0; i < phrases.length; i++) {
       const nextStart = phrases[i+1]?.startBeat ?? Infinity;
-      // We are in phrase i if we are past its startBeat (or just before it) and before the next phrase
-      if (currentBeat < nextStart) {
-        return i;
-      }
+      if (currentBeat < nextStart) return i;
     }
     return phrases.length - 1;
   }, [currentBeat, phrases]);
@@ -100,104 +91,134 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   const currentPhrase = phrases[activePhraseIdx];
   const nextPhrase = phrases[activePhraseIdx + 1];
 
-  // 3. Pitch Detection
+  // 3. Scoring System
+  const totalScoreableBeats = useMemo(() => {
+    let sum = 0;
+    metadata.notes.forEach(n => {
+      if (n.note_type === ':' || n.note_type === 'F') sum += n.length;
+      else if (n.note_type === '*') sum += n.length * 2;
+    });
+    return Math.max(sum, 1);
+  }, [metadata]);
+
   const detectedPitch = usePitchDetector(micDeviceId);
-  const [pitchHistory, setPitchHistory] = useState<{beat: number, pitch: number}[]>([]);
+  const [pitchHistory, setPitchHistory] = useState<{beat: number, pitch: number, isHit: boolean}[]>([]);
+  const [score, setScore] = useState(0);
+  
   const lastTimeRef = useRef(currentTime);
+  const lastBeatRef = useRef(currentBeat);
 
   useEffect(() => {
-    // Clear history when we change phrase or seek backward
-    if (currentTime < lastTimeRef.current || pitchHistory.length > 300) {
+    // Detect seeking/restarting
+    if (currentTime < lastTimeRef.current || currentBeat < lastBeatRef.current) {
+      setScore(0);
       setPitchHistory([]);
     }
-    if (detectedPitch !== null) {
-      setPitchHistory(prev => [...prev, { beat: currentBeat, pitch: detectedPitch }]);
-    }
-    lastTimeRef.current = currentTime;
-  }, [detectedPitch, currentBeat, currentTime]);
 
-  // 3. Pitch calculations for the active phrase to normalize Y axis
+    const deltaBeat = Math.max(0, currentBeat - lastBeatRef.current);
+    let isHit = false;
+    
+    if (detectedPitch !== null && deltaBeat > 0 && currentPhrase) {
+      const activeNote = currentPhrase.notes.find(n => currentBeat >= n.beat && currentBeat < n.beat + n.length);
+      if (activeNote && activeNote.note_type !== '-' && activeNote.note_type !== 'E') {
+        const targetClass = (activeNote.pitch % 12 + 12) % 12;
+        const sungClass = (detectedPitch % 12 + 12) % 12;
+        const diff = Math.abs(targetClass - sungClass);
+        
+        // 1 semitone tolerance
+        if (diff <= 1 || diff >= 11) {
+          isHit = true;
+          const multiplier = activeNote.note_type === '*' ? 2 : 1;
+          const pointsToAdd = (10000 / totalScoreableBeats) * deltaBeat * multiplier;
+          setScore(s => Math.min(10000, s + pointsToAdd));
+        }
+      }
+    }
+
+    if (detectedPitch !== null) {
+      // Limit history size
+      setPitchHistory(prev => {
+        const next = [...prev, { beat: currentBeat, pitch: detectedPitch, isHit }];
+        if (next.length > 200) return next.slice(-200);
+        return next;
+      });
+    }
+    
+    lastTimeRef.current = currentTime;
+    lastBeatRef.current = currentBeat;
+  }, [detectedPitch, currentBeat, currentTime, currentPhrase, totalScoreableBeats]);
+
+  // Pitch calculations for the active phrase to normalize Y axis
   const minPitch = currentPhrase ? currentPhrase.notes.reduce((m, n) => Math.min(m, n.pitch), 100) : 0;
   const maxPitch = currentPhrase ? currentPhrase.notes.reduce((m, n) => Math.max(m, n.pitch), -100) : 1;
-  const pitchRange = Math.max(maxPitch - minPitch, 12); // Minimum visual range of 1 octave (12 semitones)
-
-  const noteColors: Record<string, string> = {
-    ':': 'bg-blue-500',
-    '*': 'bg-yellow-400',
-    'F': 'bg-purple-500',
-    'R': 'bg-green-500',
-    'r': 'bg-green-300',
-    'G': 'bg-pink-500',
-  };
+  const pitchRange = Math.max(maxPitch - minPitch, 14); // Provide vertical padding
 
   const renderPhrasePianoRoll = (phrase: Phrase, isActivePhrase: boolean) => {
-    const leadInBeats = 8; // Show 8 beats before the phrase starts
+    const leadInBeats = 8;
     const viewStartBeat = phrase.startBeat - leadInBeats;
     const totalBeatsView = Math.max(phrase.endBeat - viewStartBeat, 10); 
     
-    // Calculate sweeper position
-    const sweeperPercent = ((currentBeat - viewStartBeat) / totalBeatsView) * 90;
+    const sweeperPercent = ((currentBeat - viewStartBeat) / totalBeatsView) * 100;
     const isSweeperVisible = isActivePhrase && sweeperPercent >= 0 && currentBeat <= phrase.endBeat;
 
     return (
-      <div className={`relative w-full h-full transition-opacity duration-500 ${isActivePhrase ? 'opacity-100' : 'opacity-20'}`}>
+      <div className={`relative w-full h-full transition-opacity duration-500 ${isActivePhrase ? 'opacity-100' : 'opacity-0 hidden'}`}>
+        
+        {/* Pitch Lines Background */}
+        <div className="absolute inset-0 flex flex-col justify-between opacity-20 pointer-events-none">
+          {[...Array(12)].map((_, i) => (
+            <div key={i} className="w-full h-px bg-slate-400" />
+          ))}
+        </div>
+
         {phrase.notes.map((note, idx) => {
           const isNoteActive = currentBeat >= note.beat && currentBeat < (note.beat + note.length);
           const isNotePast = currentBeat >= (note.beat + note.length);
           
-          // X-Axis mapping with lead-in
-          const leftPercent = ((note.beat - viewStartBeat) / totalBeatsView) * 90; 
-          const widthPercent = (note.length / totalBeatsView) * 90;
+          const leftPercent = ((note.beat - viewStartBeat) / totalBeatsView) * 100; 
+          const widthPercent = (note.length / totalBeatsView) * 100;
           
-          // Y-Axis mapping (higher pitch = lower top value)
           const pitchOffset = note.pitch - minPitch;
           const topPercent = 100 - (((pitchOffset + 2) / (pitchRange + 4)) * 100); 
 
-          const colorClass = noteColors[note.note_type] || 'bg-slate-500';
-
+          // USDX Style 3D Pills
+          let baseGradient = 'from-slate-400 via-slate-300 to-slate-500';
+          let borderColor = 'border-slate-500';
+          if (note.note_type === '*') {
+            baseGradient = 'from-yellow-400 via-yellow-200 to-yellow-600';
+            borderColor = 'border-yellow-600';
+          }
+          
           return (
             <div
               key={idx}
               className={`absolute rounded-full transition-all duration-100 flex items-center justify-center overflow-hidden
-                ${isNoteActive ? 'scale-110 shadow-lg shadow-white/50 z-10' : 'z-0'}
-                ${isNotePast ? 'opacity-50 grayscale' : 'opacity-90'}
-                ${note.note_type === '*' ? 'animate-pulse' : ''}
+                border-2 ${borderColor} bg-gradient-to-b ${baseGradient} shadow-[inset_0_2px_4px_rgba(255,255,255,0.5),0_4px_8px_rgba(0,0,0,0.5)]
+                ${isNoteActive ? 'scale-105 z-10 ring-2 ring-white/50' : 'z-0'}
               `}
               style={{
                 left: `${leftPercent}%`,
                 width: `${Math.max(widthPercent, 2)}%`,
                 top: `${topPercent}%`,
-                height: '16px',
-                marginTop: '-8px',
-                backgroundColor: isNoteActive ? '#3b82f6' : undefined, 
+                height: '24px',
+                marginTop: '-12px',
+                opacity: isNotePast ? 0.7 : 1,
               }}
             >
-              <div className={`w-full h-full ${colorClass}`} />
+              {/* Note Fill (If passed and hit, wait we don't have perfect history for past notes easily here, 
+                  but we can just draw the pitch history blocks on top. ) */}
             </div>
           );
         })}
 
-        {/* Progress Sweeper */}
-        {isSweeperVisible && (
-          <div 
-            className="absolute top-0 bottom-0 w-1 bg-white shadow-[0_0_15px_white] z-20"
-            style={{ left: `${sweeperPercent}%` }}
-          />
-        )}
-
-        {/* Pitch History (Octave-agnostic matching to closest note) */}
+        {/* Pitch History Blocks (Sung pitch) */}
         {isActivePhrase && pitchHistory.map((pt, i) => {
-          // Only show points within this phrase's view
           if (pt.beat < viewStartBeat || pt.beat > phrase.endBeat) return null;
 
-          // Find the active target note at this beat to normalize octave
-          let targetPitch = minPitch + (pitchRange / 2); // default center
+          let targetPitch = minPitch + (pitchRange / 2);
           const activeNote = phrase.notes.find(n => pt.beat >= n.beat && pt.beat < n.beat + n.length);
-          if (activeNote) {
-            targetPitch = activeNote.pitch;
-          }
+          if (activeNote) targetPitch = activeNote.pitch;
 
-          // Octave normalization: force sung pitch to the closest octave of target pitch
           const noteClassTarget = (targetPitch % 12 + 12) % 12;
           const noteClassSung = (pt.pitch % 12 + 12) % 12;
           const classDiff = noteClassSung - noteClassTarget;
@@ -207,52 +228,60 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
           else if (classDiff < -6) normalizedPitch = targetPitch + classDiff + 12;
           else normalizedPitch = targetPitch + classDiff;
 
-          const ptLeftPercent = ((pt.beat - viewStartBeat) / totalBeatsView) * 90;
+          const ptLeftPercent = ((pt.beat - viewStartBeat) / totalBeatsView) * 100;
           const pitchOffset = normalizedPitch - minPitch;
           const ptTopPercent = 100 - (((pitchOffset + 2) / (pitchRange + 4)) * 100);
+
+          // Hit color = Blue, Miss color = Grey
+          const blockColor = pt.isHit ? 'from-blue-400 to-blue-600' : 'from-slate-400 to-slate-600';
 
           return (
             <div 
               key={i}
-              className="absolute w-2 h-2 rounded-full bg-cyan-300 shadow-[0_0_8px_cyan] z-30"
+              className={`absolute h-5 rounded-sm bg-gradient-to-b ${blockColor} shadow-md z-30 opacity-90`}
               style={{
-                left: `calc(${ptLeftPercent}% - 4px)`,
-                top: `calc(${ptTopPercent}% - 4px)`,
+                left: `calc(${ptLeftPercent}% - 6px)`,
+                top: `calc(${ptTopPercent}% - 10px)`,
+                width: '12px'
               }}
             />
           );
         })}
-        
-        {/* Approaching text if waiting for gap/lead-in */}
-        {isActivePhrase && currentBeat < phrase.startBeat && currentBeat >= viewStartBeat && (
+
+        {/* Progress Sweeper */}
+        {isSweeperVisible && (
           <div 
-            className="absolute top-1/2 -translate-y-1/2 text-white/50 font-bold italic text-xl z-0"
-            style={{ left: `${((phrase.startBeat - viewStartBeat) / totalBeatsView) * 90 + 2}%` }}
-          >
-            Get ready...
-          </div>
+            className="absolute top-0 bottom-0 w-1 bg-white shadow-[0_0_20px_rgba(255,255,255,1)] z-40"
+            style={{ left: `${sweeperPercent}%` }}
+          />
         )}
       </div>
     );
   };
 
-  const renderLyrics = (phrase: Phrase | undefined) => {
+  const renderLyrics = (phrase: Phrase | undefined, isNext: boolean) => {
     if (!phrase) return null;
     return (
-      <div className="flex flex-wrap justify-center gap-x-1 gap-y-2 text-2xl md:text-4xl font-bold px-4">
+      <div className={`flex flex-wrap justify-center gap-x-1 font-bold px-4 
+        ${isNext ? 'text-xl md:text-2xl text-slate-400' : 'text-3xl md:text-5xl text-white'}`}
+      >
         {phrase.notes.map((note, idx) => {
-          const isNoteActive = currentBeat >= note.beat && currentBeat < (note.beat + note.length);
           const isNotePast = currentBeat >= (note.beat + note.length);
+          const isNoteActive = currentBeat >= note.beat && !isNotePast;
           
-          let colorClass = 'text-white/40';
-          if (isNoteActive) colorClass = 'text-blue-400 drop-shadow-[0_0_8px_rgba(59,130,246,0.8)] scale-110';
-          else if (isNotePast) colorClass = 'text-white drop-shadow-md';
+          let colorClass = '';
+          if (!isNext) {
+            if (isNotePast || isNoteActive) {
+              colorClass = 'text-blue-400 drop-shadow-[0_0_8px_rgba(59,130,246,0.8)]';
+            } else {
+              colorClass = 'text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.8)]';
+            }
+          }
 
-          // Ensure spaces are respected if they exist at the start/end of the syllable
           const text = note.text.replace(/ /g, '\u00A0');
 
           return (
-            <span key={idx} className={`transition-all duration-100 ${colorClass}`}>
+            <span key={idx} className={`transition-colors duration-100 ${colorClass}`}>
               {text}
             </span>
           );
@@ -262,47 +291,36 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   };
 
   return (
-    <div className="flex flex-col h-full w-full bg-slate-950">
-      <div className="text-center px-4 py-3 bg-slate-900 border-b border-slate-800 shrink-0">
-        <h2 className="text-2xl font-bold text-white truncate drop-shadow-md">
-          {metadata.title || 'Unknown Title'}
-        </h2>
-        {metadata.artist && (
-          <p className="text-md text-blue-400 truncate">{metadata.artist}</p>
-        )}
-        <div className="flex items-center justify-center gap-4 text-xs text-slate-500 mt-2">
-          <span>{metadata.bpm > 0 ? `${metadata.bpm} BPM` : 'No BPM'}</span>
-          <span>{formatTime(currentTime)} / {formatTime(metadata.total_duration)}</span>
-        </div>
+    <div className="flex flex-col h-full w-full bg-slate-950 font-sans relative">
+      
+      {/* SCORE BOX (Top Right) */}
+      <div className="absolute top-4 right-4 z-50 bg-gradient-to-b from-blue-500 to-blue-700 border-2 border-blue-400 rounded-lg shadow-[0_4px_15px_rgba(0,0,0,0.5)] px-6 py-2 flex items-center justify-center">
+        <span className="text-white font-black text-3xl tracking-widest drop-shadow-md">
+          {Math.floor(score).toString().padStart(5, '0')}
+        </span>
       </div>
 
-      <div className="flex-1 relative overflow-hidden flex flex-col p-6">
+      <div className="flex-1 relative overflow-hidden flex flex-col pt-12 pb-32">
         {/* Piano Roll Area */}
-        <div className="flex-1 relative bg-slate-900/50 rounded-xl border border-slate-800/50 mb-6 overflow-hidden">
-          {/* Horizontal lines for visual structure */}
-          <div className="absolute inset-0 flex flex-col justify-between opacity-10 pointer-events-none">
-            {[...Array(5)].map((_, i) => (
-              <div key={i} className="w-full h-px bg-white" />
-            ))}
-          </div>
-
+        <div className="flex-1 relative w-full px-8">
           {currentPhrase && renderPhrasePianoRoll(currentPhrase, true)}
         </div>
+      </div>
 
-        {/* Lyrics Area */}
-        <div className="shrink-0 min-h-[120px] flex flex-col justify-center items-center gap-4 bg-slate-900/30 rounded-xl p-4 border border-slate-800/30">
-          {renderLyrics(currentPhrase)}
-          {nextPhrase && currentBeat > currentPhrase.endBeat - 2 && (
-            <div className="text-sm text-slate-500 italic mt-2 animate-pulse">
-              Up next: {nextPhrase.notes.map(n => n.text).join('').trim()}
-            </div>
-          )}
+      {/* Lyrics Area (USDX Style Bottom Box) */}
+      <div className="absolute bottom-0 left-0 right-0 h-40 bg-gradient-to-t from-slate-900 via-slate-800/90 to-transparent flex flex-col justify-end pb-8 pt-12 border-t border-white/10 shadow-[0_-10px_20px_rgba(0,0,0,0.5)]">
+        <div className="flex flex-col items-center justify-center gap-2">
+          {renderLyrics(currentPhrase, false)}
+          <div className="h-8 mt-1">
+            {renderLyrics(nextPhrase, true)}
+          </div>
         </div>
       </div>
 
-      <div className="h-1.5 bg-slate-800 shrink-0">
+      {/* Progress Bar (Bottom Edge) */}
+      <div className="absolute bottom-0 left-0 right-0 h-1 bg-slate-800 z-50">
         <div
-          className="h-full bg-gradient-to-r from-blue-600 to-blue-400 transition-all duration-200"
+          className="h-full bg-blue-500 transition-all duration-200"
           style={{ width: `${(currentTime / metadata.total_duration) * 100}%` }}
         />
       </div>
