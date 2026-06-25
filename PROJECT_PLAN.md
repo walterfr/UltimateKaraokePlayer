@@ -22,7 +22,7 @@ Implementação individual de cada motor de reprodução, seguida de validação
 1. [x] CDG Engine (MP3+G) - *Parser, Áudio e Sincronização concluídos!*
 2. [x] Synth Engine (MIDI/KAR) - *Parser MIDI, extração de letras e renderização concluídos!*
 3. [x] Video Engine (MP4/ASS/LRC/SRT) - *Player nativo + overlay de legendas concluído!*
-4. [x] Ultrastar Engine (TXT+MP3) - *Parser de notas estilo SingStar*
+4. [x] Ultrastar Engine (TXT+MP3) - *Gamificação completa (Pitch detection, USDX UI, Scores, End Screen, Video BG)*
 5. [x] Tracker Engine (MOD/XM/S3M) - *Parser de cabeçalhos e estrutura concluído!*
 6. [x] Legacy Engine (MK1/KARA) - *Parser de cabeçalhos MK1/KARA concluído!*
 
@@ -48,7 +48,6 @@ Implementação individual de cada motor de reprodução, seguida de validação
 - [ ] Polimento de UI/UX.
 
 ## 📅 Próximos Passos (Sessão Atual)
-- [x] Implementar servidor HTTP Axum para API REST de biblioteca/fila
-- [x] Adicionar suporte WebSocket para sincronização em tempo real
-- [x] Criar interface web para clientes remotos
-- [ ] Finalizar integração de áudio MIDI com fluid-synth
+- [x] Gamificação do Motor Ultrastar (UI, Pontuação, Microfone)
+- [ ] Melhorar Motor Tracker (Implementar reprodução real dos samples)
+- [ ] Melhorar Motor MIDI (Finalizar integração fluida com soundfonts/fluid-synth)

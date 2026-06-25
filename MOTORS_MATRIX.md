@@ -22,9 +22,9 @@ Esta matriz define os motores de renderização e reprodução necessários para
 
 ## 4. Ultrastar Engine (Pitch-based Game)
 *   **Formatos:** `.txt` (Ultrastar Deluxe header + notas) + `.mp3`/`.ogg` (áudio) + `.jpg`/`.png`/`.mp4` (background)
-*   **Tecnologia:** Parser de metadados (`#TITLE`, `#ARTIST`, `#MP3`, `#BPM`, `#GAP`, `#VIDEO`, `#COVER`) + Parser de notas (`. .-*FR`) com beats → tempo real + Reprodutor de áudio (rodio)
-*   **Objetivo:** Interpretar o formato de karaokê do Ultrastar Deluxe (SingStar-like) com detecção de pitch, notas douradas, freestyle, rolls e suporte a fundo musical/vídeo/capa.
-*   **Status:** ✅ **Concluído e Integrado** (Parser de cabeçalho/notas Ultrastar, renderização estilo SingStar com notas coloridas e scroll automático).
+*   **Tecnologia:** Parser de metadados + Auto-Correlação Matemática (Pitch Detection via Web Audio API) + CSS 3D Rendering
+*   **Objetivo:** Interpretar o formato de karaokê do Ultrastar Deluxe (SingStar-like) com mecânicas de jogo completas.
+*   **Status:** ✅ **Concluído e Integrado** (Mecânica de jogo idêntica ao USDX: piano roll 3D, detecção de tom pelo microfone em tempo real, normalização de oitava, sistema de "fill" de nota, pontuação máxima de 10.000 pontos, tela de classificação de níveis e suporte a vídeos/imagens de fundo simultâneos).
 
 ## 5. Tracker Engine (Sample-based)
 *   **Formatos:** `.mod`, `.s3m`, `.xm`, `.st3`, `.it`
