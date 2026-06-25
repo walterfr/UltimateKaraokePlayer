@@ -1,7 +1,10 @@
 {
   "name": "ultimate-karaoke-player",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "description": "O Player de Karaokê definitivo com suporte a múltiplos motores: CDG, MIDI, Video, Ultrastar e Tracker.",
+  "author": "Walter",
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "dev": "vite",
