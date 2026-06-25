@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use tauri::Manager;
+
 mod cdg_parser;
 mod synth_engine;
 mod video_engine;
@@ -130,36 +132,9 @@ struct AudioEngine {
     tx: mpsc::Sender<AudioCommand>,
 }
 
-/// Busca o arquivo SF2 em vários diretórios possíveis
-fn find_sf2() -> Option<std::path::PathBuf> {
-    let candidates = vec![
-        // 1. Ao lado do executável (produção e dev)
-        std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("TimGM6mb.sf2"))),
-        // 2. Pasta src-tauri (onde o arquivo realmente está)
-        std::env::current_exe().ok().and_then(|p| {
-            p.parent()
-                .and_then(|d| d.parent()) // target
-                .and_then(|d| d.parent()) // src-tauri
-                .map(|d| d.join("TimGM6mb.sf2"))
-        }),
-        // 3. current_dir (pode funcionar em alguns cenários)
-        std::env::current_dir().ok().map(|d| d.join("TimGM6mb.sf2")),
-        // 4. current_dir/src-tauri
-        std::env::current_dir().ok().map(|d| d.join("src-tauri").join("TimGM6mb.sf2")),
-    ];
-
-    for candidate in candidates.into_iter().flatten() {
-        println!("[MIDI] Tentando SF2: {:?} -> exists={}", candidate, candidate.exists());
-        if candidate.exists() {
-            println!("[MIDI] ✓ SF2 encontrado: {:?}", candidate);
-            return Some(candidate);
-        }
-    }
-    None
-}
 
 impl AudioEngine {
-    fn new() -> Self {
+    fn new(sf2_path: Option<std::path::PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
         
         // Dispara uma thread nativa persistente para segurar o contexto do Rodio
@@ -278,7 +253,7 @@ impl AudioEngine {
                         is_midi = ext == "mid" || ext == "kar";
                         
                         if is_midi {
-                            match find_sf2() {
+                            match &sf2_path {
                                 Some(sf2_path) => {
                                     let sf2_str = sf2_path.to_string_lossy().to_string();
                                     println!("[MIDI] Criando MidiSource com SF2={}", sf2_str);
@@ -350,7 +325,7 @@ impl AudioEngine {
                                 };
                                 new_sink.set_volume(current_volume);
                                 
-                                if let Some(sf2_path) = find_sf2() {
+                                if let Some(ref sf2_path) = sf2_path {
                                     let sf2_str = sf2_path.to_string_lossy().to_string();
                                     if let Ok(mut source) = MidiSource::new(path, &sf2_str) {
                                         // Avança o sequencer renderizando em silêncio até a posição desejada
@@ -738,7 +713,7 @@ fn main() {
             move |app| {
                 let handle = app.handle();
                 let state = remote::RemoteState {
-                    library: library_arc,
+                    library: library_arc.clone(),
                     app_handle: handle,
                 };
                 
@@ -746,13 +721,17 @@ fn main() {
                     remote::start_server(state).await;
                 });
                 
+                let sf2_path = app.path_resolver()
+                    .resolve_resource("TimGM6mb.sf2");
+                
+                app.manage(AppState {
+                    audio_engine: Arc::new(Mutex::new(AudioEngine::new(sf2_path))),
+                    library: library_arc,
+                    current_song_id: Arc::new(AtomicUsize::new(0)),
+                });
+                
                 Ok(())
             }
-        })
-        .manage(AppState {
-            audio_engine: Arc::new(Mutex::new(AudioEngine::new())),
-            library: library_arc,
-            current_song_id: Arc::new(AtomicUsize::new(0)),
         })
         .invoke_handler(tauri::generate_handler![
             play_song, parse_cdg_file, parse_midi_file, parse_video_file,
