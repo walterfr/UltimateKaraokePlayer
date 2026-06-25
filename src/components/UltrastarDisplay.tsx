@@ -320,6 +320,22 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
 
   const isFinished = currentTime >= metadata.total_duration - 1.0;
 
+  const [autoContinueCancelled, setAutoContinueCancelled] = useState(false);
+  const [endCountdown, setEndCountdown] = useState(10);
+
+  useEffect(() => {
+    if (isFinished && !autoContinueCancelled) {
+      if (endCountdown <= 0) {
+        if (onFinish) onFinish();
+        return;
+      }
+      const timer = setTimeout(() => {
+        setEndCountdown(c => c - 1);
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [isFinished, autoContinueCancelled, endCountdown, onFinish]);
+
   const getRank = (score: number) => {
     if (score < 2000) return { title: 'Tone Deaf', color: 'text-gray-400' };
     if (score < 4000) return { title: 'Amateur', color: 'text-blue-400' };
@@ -395,7 +411,10 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
 
       {/* END SCREEN OVERLAY */}
       {isFinished && (
-        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in duration-1000">
+        <div 
+          className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in duration-1000"
+          onMouseMove={() => setAutoContinueCancelled(true)}
+        >
           <h2 className="text-4xl text-white font-bold mb-2 drop-shadow-lg">{metadata.title}</h2>
           <p className="text-xl text-slate-300 mb-8">{metadata.artist}</p>
           
@@ -417,7 +436,7 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
             onClick={() => onFinish && onFinish()}
             className="mt-12 px-8 py-4 bg-blue-600 hover:bg-blue-500 transition-colors text-white font-bold rounded-full text-xl shadow-[0_0_20px_rgba(59,130,246,0.6)]"
           >
-            Continue
+            Continue {(!autoContinueCancelled && endCountdown > 0) ? `(${endCountdown}s)` : ''}
           </button>
         </div>
       )}
