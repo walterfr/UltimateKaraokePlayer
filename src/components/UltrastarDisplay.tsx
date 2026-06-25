@@ -154,7 +154,8 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
   const pitchRange = Math.max(maxPitch - minPitch, 14); // Provide vertical padding
 
   const renderPhrasePianoRoll = (phrase: Phrase, isActivePhrase: boolean) => {
-    const leadInBeats = 8;
+    // Show 4 seconds of lead-in before the phrase starts
+    const leadInBeats = Math.max(16, Math.ceil(4 / beatDuration));
     const viewStartBeat = phrase.startBeat - leadInBeats;
     const totalBeatsView = Math.max(phrase.endBeat - viewStartBeat, 10); 
     
@@ -248,6 +249,15 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
           );
         })}
 
+        {/* Countdown Timer */}
+        {isActivePhrase && currentBeat < phrase.startBeat && currentBeat >= viewStartBeat && (
+          <div 
+            className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-white/50 font-black italic text-6xl md:text-8xl z-0 animate-pulse drop-shadow-[0_4px_10px_rgba(0,0,0,0.8)]"
+          >
+            {Math.ceil((phrase.startBeat - currentBeat) * beatDuration)}
+          </div>
+        )}
+
         {/* Progress Sweeper */}
         {isSweeperVisible && (
           <div 
@@ -278,7 +288,7 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
             }
           }
 
-          const text = note.text.replace(/ /g, '\u00A0');
+          const text = note.text.replace(/~/g, '').replace(/ /g, '\u00A0');
 
           return (
             <span key={idx} className={`transition-colors duration-100 ${colorClass}`}>
