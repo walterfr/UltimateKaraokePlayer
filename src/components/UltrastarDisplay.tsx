@@ -33,6 +33,7 @@ interface UltrastarDisplayProps {
   currentTime: number;
   micDeviceId?: string;
   songFilePath?: string;
+  onFinish?: () => void;
 }
 
 interface Phrase {
@@ -41,7 +42,7 @@ interface Phrase {
   notes: UltrastarNote[];
 }
 
-const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying, currentTime, micDeviceId, songFilePath }) => {
+const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying, currentTime, micDeviceId, songFilePath, onFinish }) => {
   if (!metadata) {
     return (
       <div className="flex items-center justify-center h-full text-slate-500">
@@ -317,6 +318,21 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
     );
   };
 
+  const isFinished = currentTime >= metadata.total_duration - 1.0;
+
+  const getRank = (score: number) => {
+    if (score < 2000) return { title: 'Tone Deaf', color: 'text-gray-400' };
+    if (score < 4000) return { title: 'Amateur', color: 'text-blue-400' };
+    if (score < 5000) return { title: 'Wannabe', color: 'text-teal-400' };
+    if (score < 6000) return { title: 'Hopeful', color: 'text-green-400' };
+    if (score < 7000) return { title: 'Rising Star', color: 'text-yellow-400' };
+    if (score < 8000) return { title: 'Lead Singer', color: 'text-orange-400' };
+    if (score < 9000) return { title: 'Superstar', color: 'text-purple-400' };
+    return { title: 'Ultrastar!', color: 'text-pink-500 animate-pulse' };
+  };
+
+  const rank = getRank(score);
+
   return (
     <div className="flex flex-col h-full w-full bg-slate-950 font-sans relative">
       
@@ -376,6 +392,35 @@ const UltrastarDisplay: React.FC<UltrastarDisplayProps> = ({ metadata, isPlaying
           style={{ width: `${(currentTime / metadata.total_duration) * 100}%` }}
         />
       </div>
+
+      {/* END SCREEN OVERLAY */}
+      {isFinished && (
+        <div className="absolute inset-0 z-50 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center p-8 animate-in fade-in duration-1000">
+          <h2 className="text-4xl text-white font-bold mb-2 drop-shadow-lg">{metadata.title}</h2>
+          <p className="text-xl text-slate-300 mb-8">{metadata.artist}</p>
+          
+          <div className="bg-slate-900/80 border border-slate-700 p-8 rounded-2xl shadow-2xl flex flex-col items-center gap-6 min-w-[400px]">
+            <h3 className="text-slate-400 uppercase tracking-widest text-sm font-bold">Final Score</h3>
+            <div className="text-7xl font-black text-white drop-shadow-[0_0_15px_rgba(255,255,255,0.5)] tracking-widest">
+              {Math.floor(score).toString().padStart(5, '0')}
+            </div>
+            
+            <div className="w-full h-px bg-slate-800 my-2" />
+            
+            <h3 className="text-slate-400 uppercase tracking-widest text-sm font-bold">Ranking</h3>
+            <div className={`text-5xl font-black drop-shadow-md ${rank.color}`}>
+              {rank.title}
+            </div>
+          </div>
+
+          <button 
+            onClick={() => onFinish && onFinish()}
+            className="mt-12 px-8 py-4 bg-blue-600 hover:bg-blue-500 transition-colors text-white font-bold rounded-full text-xl shadow-[0_0_20px_rgba(59,130,246,0.6)]"
+          >
+            Continue
+          </button>
+        </div>
+      )}
     </div>
   );
 };

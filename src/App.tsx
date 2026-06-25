@@ -135,7 +135,9 @@ const App = () => {
           else if (playMode === 'cdg') max = 600;
           if (next >= max) {
             setIsPlaying(false);
-            playNextInQueue();
+            if (playMode !== 'ultrastar') {
+              playNextInQueue();
+            }
             return max;
           }
           return next;
@@ -481,6 +483,7 @@ const App = () => {
                 currentTime={currentTimeSec} 
                 micDeviceId={selectedInputDevice}
                 songFilePath={currentFilePath}
+                onFinish={playNextInQueue}
               />
             </div>
           )}
