@@ -40,7 +40,14 @@ const TrackerDisplay: React.FC<TrackerDisplayProps> = ({ metadata, isPlaying, cu
   }
 
   return (
-    <div className="flex flex-col h-full w-full bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900">
+    <div className="flex flex-col h-full w-full bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950 relative overflow-hidden">
+      {/* Background ambient lighting */}
+      <div className="absolute inset-0 pointer-events-none opacity-40">
+        <div className="absolute -top-[20%] -left-[10%] w-[60vw] h-[60vw] bg-emerald-600/20 rounded-full blur-[120px] mix-blend-screen animate-[pulse_8s_ease-in-out_infinite]" />
+        <div className="absolute -bottom-[20%] -right-[10%] w-[70vw] h-[70vw] bg-teal-600/20 rounded-full blur-[150px] mix-blend-screen animate-[pulse_12s_ease-in-out_infinite_reverse]" />
+      </div>
+      
+      <div className="relative z-10 flex flex-col h-full w-full">
       {/* Header */}
       <div className="text-center px-6 py-6 border-b border-slate-700/50">
         <div className="flex items-center justify-center gap-2 text-emerald-400 mb-1">
@@ -106,13 +113,14 @@ const TrackerDisplay: React.FC<TrackerDisplayProps> = ({ metadata, isPlaying, cu
 
       {/* Playing indicator */}
       {isPlaying && (
-        <div className="h-1 bg-emerald-500/30">
+        <div className="h-1.5 bg-slate-800 shrink-0">
           <div 
-            className="h-full bg-emerald-400 transition-all duration-200"
+            className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 transition-all duration-200"
             style={{ width: `${((currentTime % 60) / 60) * 100}%` }}
           />
         </div>
       )}
+      </div>
     </div>
   );
 };

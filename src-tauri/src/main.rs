@@ -121,7 +121,7 @@ impl rodio::Source for MidiSource {
 struct TrackerSource {
     player: XmrsPlayer<'static>,
     module_ptr: *mut Module,
-    next_sample: Option<i16>,
+    next_sample: Option<f32>,
 }
 
 unsafe impl Send for TrackerSource {}
@@ -151,15 +151,16 @@ impl Drop for TrackerSource {
 }
 
 impl Iterator for TrackerSource {
-    type Item = i16;
+    type Item = f32;
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(sample) = self.next_sample.take() {
             return Some(sample);
         }
         
         if let Some((l, r)) = self.player.sample(true) {
-            self.next_sample = Some(r);
-            Some(l)
+            // xmrsplayer returns Option<(i16, i16)>. We convert to f32.
+            self.next_sample = Some(r as f32 / 32768.0);
+            Some(l as f32 / 32768.0)
         } else {
             None // end of song
         }
