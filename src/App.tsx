@@ -42,7 +42,7 @@ const App = () => {
   const [engineFolders, setEngineFolders] = useState<Record<string, string>>({});
   const [inputDevices, setInputDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedInputDevice, setSelectedInputDevice] = useState<string>('none');
-  const [outputDevices, setOutputDevices] = useState<{name: string, is_default: boolean}[]>([]);
+  const [outputDevices, setOutputDevices] = useState<string[]>([]);
 
   // Initialize library
   useEffect(() => {
@@ -646,7 +646,7 @@ const App = () => {
             }}
           >
             {outputDevices.map((d, i) => (
-              <option key={i} value={d.name}>{d.name}</option>
+              <option key={i} value={d}>{d}</option>
             ))}
           </select>
         </div>
