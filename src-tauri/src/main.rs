@@ -10,6 +10,8 @@ mod legacy_engine;
 mod ultrastar_engine;
 mod library;
 mod remote;
+mod bass_engine;
+pub mod star3_engine;
 
 use std::sync::mpsc;
 use std::thread;
@@ -34,19 +36,18 @@ use xmrs::prelude::Module;
 use xmrsplayer::xmrsplayer::XmrsPlayer;
 
 struct MidiSource {
-    sequencer: MidiFileSequencer,
-    left_buf: Vec<f32>,
-    right_buf: Vec<f32>,
-    buf_idx: usize,
-    debug_printed: bool,
-    zero_count: usize,
+    pub sequencer: MidiFileSequencer,
+    pub left_buf: Vec<f32>,
+    pub right_buf: Vec<f32>,
+    pub buf_idx: usize,
+    pub debug_printed: bool,
 }
 
 impl MidiSource {
-    fn new(midi_path: &str, sf2_path: &str) -> Result<Self, String> {
+    fn new(midi_path: &str, sf2_path: &str, sample_rate: u32) -> Result<Self, String> {
         let mut sf2 = std::fs::File::open(sf2_path).map_err(|e| format!("SF2 error: {}", e))?;
         let sound_font = Arc::new(SoundFont::new(&mut sf2).map_err(|e| format!("SF2 parse error: {}", e))?);
-        let settings = SynthesizerSettings::new(44100);
+        let settings = SynthesizerSettings::new(sample_rate as i32);
         let synthesizer = Synthesizer::new(&sound_font, &settings).map_err(|e| format!("Synth error: {}", e))?;
         
         let mut mid_file = std::fs::File::open(midi_path).map_err(|e| format!("MIDI error: {}", e))?;
@@ -59,42 +60,22 @@ impl MidiSource {
             sequencer,
             left_buf: vec![0.0; 1024],
             right_buf: vec![0.0; 1024],
-            buf_idx: 1024 * 2, // force initial render
+            buf_idx: 1024 * 2,
             debug_printed: false,
-            zero_count: 0,
         })
     }
 }
 
 impl Iterator for MidiSource {
-    type Item = i16;
+    type Item = f32;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.buf_idx >= self.left_buf.len() * 2 {
+        let max_samples = self.left_buf.len();
+        let max_indices = max_samples * 2;
+        
+        if self.buf_idx >= max_indices {
             self.sequencer.render(&mut self.left_buf, &mut self.right_buf);
             self.buf_idx = 0;
-            
-            if !self.debug_printed {
-                // Check if buffer is all zeros
-                let mut all_zeros = true;
-                let mut max_val = 0.0f32;
-                for &v in &self.left_buf {
-                    if v.abs() > max_val { max_val = v.abs(); }
-                    if v != 0.0 { all_zeros = false; }
-                }
-                
-                if all_zeros {
-                    self.zero_count += 1;
-                    if self.zero_count % 100 == 0 {
-                        println!("[MIDI DEBUG] 100 blocos renderizados com ZEROS totais...");
-                    }
-                } else {
-                    println!("[MIDI DEBUG] Áudio não é zero! Valor máximo no bloco: {}", max_val);
-                    self.debug_printed = true;
-                }
-            }
-            
             if self.sequencer.end_of_sequence() {
-                println!("[MIDI DEBUG] end_of_sequence atingido!");
                 return None;
             }
         }
@@ -106,38 +87,30 @@ impl Iterator for MidiSource {
         };
         
         self.buf_idx += 1;
-        let s = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
-        Some(s)
+        Some(sample)
     }
-}
-
-impl rodio::Source for MidiSource {
-    fn current_frame_len(&self) -> Option<usize> { None }
-    fn channels(&self) -> u16 { 2 }
-    fn sample_rate(&self) -> u32 { 44100 }
-    fn total_duration(&self) -> Option<Duration> { None }
 }
 
 struct TrackerSource {
     player: XmrsPlayer<'static>,
     module_ptr: *mut Module,
-    next_sample: Option<f32>,
 }
 
 unsafe impl Send for TrackerSource {}
 
 impl TrackerSource {
-    fn new(path: &str) -> Result<Self, String> {
+    fn new(path: &str, sample_rate: u32) -> Result<Self, String> {
         let data = std::fs::read(path).map_err(|e| format!("IO error: {}", e))?;
         let module = Module::load(&data).map_err(|e| format!("XMRS error: {:?}", e))?;
         let boxed_module = Box::new(module);
         let module_ptr = Box::into_raw(boxed_module);
         let module_ref: &'static Module = unsafe { &*module_ptr };
-        let player = XmrsPlayer::new(module_ref, 44100, 0);
+        
+        let mut player = XmrsPlayer::new(module_ref, sample_rate, 0);
+        player.goto(0, 0, 0);
         Ok(Self {
             player,
             module_ptr,
-            next_sample: None,
         })
     }
 }
@@ -153,28 +126,55 @@ impl Drop for TrackerSource {
 impl Iterator for TrackerSource {
     type Item = f32;
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(sample) = self.next_sample.take() {
-            return Some(sample);
-        }
-        
-        if let Some((l, r)) = self.player.sample(true) {
-            // xmrsplayer returns Option<(i16, i16)>. We convert to f32.
-            self.next_sample = Some(r as f32 / 32768.0);
-            Some(l as f32 / 32768.0)
-        } else {
-            None // end of song
-        }
+        self.player.next().map(|s| s as f32 / 32768.0)
     }
 }
 
-impl rodio::Source for TrackerSource {
-    fn current_frame_len(&self) -> Option<usize> { None }
-    fn channels(&self) -> u16 { 2 }
-    fn sample_rate(&self) -> u32 { 44100 }
-    fn total_duration(&self) -> Option<Duration> { None }
+fn build_cpal_stream<I>(device: &cpal::Device, mut source: I, volume: Arc<std::sync::atomic::AtomicU32>) -> Result<cpal::Stream, String>
+where
+    I: Iterator<Item = f32> + Send + 'static,
+{
+    use cpal::traits::{DeviceTrait, StreamTrait};
+    let config = device.default_output_config().map_err(|e| e.to_string())?;
+    let channels = config.channels() as usize;
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_output_stream(
+            &config.config(),
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                let vol = f32::from_bits(volume.load(std::sync::atomic::Ordering::Relaxed));
+                for frame in data.chunks_mut(channels) {
+                    let l = source.next().unwrap_or(0.0) * vol;
+                    let r = source.next().unwrap_or(0.0) * vol;
+                    if channels >= 1 { frame[0] = l; }
+                    if channels >= 2 { frame[1] = r; }
+                }
+            },
+            |err| eprintln!("[CPAL] error: {}", err),
+            None
+        ).map_err(|e| e.to_string())?,
+        cpal::SampleFormat::I16 => device.build_output_stream(
+            &config.config(),
+            move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                let vol = f32::from_bits(volume.load(std::sync::atomic::Ordering::Relaxed));
+                for frame in data.chunks_mut(channels) {
+                    let l = (source.next().unwrap_or(0.0) * vol * 32767.0) as i16;
+                    let r = (source.next().unwrap_or(0.0) * vol * 32767.0) as i16;
+                    if channels >= 1 { frame[0] = l; }
+                    if channels >= 2 { frame[1] = r; }
+                }
+            },
+            |err| eprintln!("[CPAL] error: {}", err),
+            None
+        ).map_err(|e| e.to_string())?,
+        _ => return Err("Unsupported sample format by CPAL".to_string()),
+    };
+
+    stream.play().map_err(|e| e.to_string())?;
+    Ok(stream)
 }
 
-// Enum de comandos para comunicar de forma segura com a thread de áudio nativa
+// Enum de comandos para comunicar de forma segura com a thread de Ã¡udio nativa
 enum AudioCommand {
     Play(String),
     Pause,
@@ -195,38 +195,46 @@ impl AudioEngine {
     fn new(sf2_path: Option<std::path::PathBuf>) -> Self {
         let (tx, rx) = mpsc::channel();
         
-        // Dispara uma thread nativa persistente para segurar o contexto do Rodio
         thread::spawn(move || {
-            use cpal::traits::{HostTrait, DeviceTrait};
-            
+            use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
+            use std::sync::atomic::AtomicU32;
+            if let Err(e) = crate::bass_engine::BassEngine::init() {
+                eprintln!("[BASS INIT ERROR] {}", e);
+            }
             let host = cpal::default_host();
+            let mut current_device = host.default_output_device();
             
-            // Estado mutável: stream + handle + sink + nome do device atual
             let mut current_stream: Option<rodio::OutputStream> = None;
             let mut current_handle: Option<rodio::OutputStreamHandle> = None;
             let mut sink: Option<rodio::Sink> = None;
+            
+            let mut current_cpal_stream: Option<cpal::Stream> = None;
+            let mut current_bass_handle: Option<crate::bass_engine::HSTREAM> = None;
+            
+            let current_volume_atomic = Arc::new(AtomicU32::new(1.0f32.to_bits()));
             let mut current_volume: f32 = 1.0;
             let mut current_path: Option<String> = None;
             let mut is_midi: bool = false;
             let mut is_tracker: bool = false;
+            let mut is_legacy: bool = false;
             
-            // Inicializa com o device padrão
             match rodio::OutputStream::try_default() {
                 Ok((stream, handle)) => {
                     current_stream = Some(stream);
                     current_handle = Some(handle);
-                    println!("[AUDIO] Inicializado com dispositivo padrão");
+                    println!("[AUDIO] Inicializado com dispositivo padrÃ£o");
                 }
-                Err(e) => eprintln!("[AUDIO] Erro ao abrir dispositivo padrão: {}", e),
+                Err(e) => eprintln!("[AUDIO] Erro ao abrir dispositivo padrÃ£o: {}", e),
             }
             
-            // Fica bloqueado consumindo comandos (MPSC Rx)
             for cmd in rx {
                 match cmd {
                     AudioCommand::SetOutputDevice(name) => {
                         println!("[AUDIO] Trocando output para: {}", name);
                         
-                        // Para o áudio atual
+                        if let Some(old_stream) = current_cpal_stream.take() {
+                            drop(old_stream);
+                        }
                         if let Some(old_sink) = sink.take() {
                             old_sink.stop();
                             drop(old_sink);
@@ -234,223 +242,210 @@ impl AudioEngine {
                         drop(current_handle.take());
                         drop(current_stream.take());
                         
-                        // Se contém "(Padrão)", usa o dispositivo padrão
-                        if name.contains("(Padrão)") {
-                            match rodio::OutputStream::try_default() {
-                                Ok((stream, handle)) => {
-                                    current_stream = Some(stream);
-                                    current_handle = Some(handle);
-                                    println!("[AUDIO] ✓ Trocado para dispositivo padrão");
-                                }
-                                Err(e) => eprintln!("[AUDIO] Erro: {}", e),
+                        if name.contains("(PadrÃ£o)") {
+                            current_device = host.default_output_device();
+                            if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+                                current_stream = Some(stream);
+                                current_handle = Some(handle);
                             }
                         } else {
-                            // Busca o dispositivo pelo nome
                             let found = host.output_devices().ok().and_then(|devices| {
-                                devices.into_iter().find(|d| {
-                                    d.name().map(|n| n == name).unwrap_or(false)
-                                })
+                                devices.into_iter().find(|d| d.name().map(|n| n == name).unwrap_or(false))
                             });
                             
                             match found {
                                 Some(device) => {
-                                    match rodio::OutputStream::try_from_device(&device) {
-                                        Ok((stream, handle)) => {
-                                            current_stream = Some(stream);
-                                            current_handle = Some(handle);
-                                            println!("[AUDIO] ✓ Trocado para: {}", name);
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[AUDIO] Erro ao abrir '{}': {}. Voltando ao padrão.", name, e);
-                                            if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
-                                                current_stream = Some(stream);
-                                                current_handle = Some(handle);
-                                            }
-                                        }
+                                    if let Ok((stream, handle)) = rodio::OutputStream::try_from_device(&device) {
+                                        current_stream = Some(stream);
+                                        current_handle = Some(handle);
                                     }
+                                    current_device = Some(device);
                                 }
                                 None => {
-                                    eprintln!("[AUDIO] Dispositivo '{}' não encontrado. Mantendo padrão.", name);
-                                    if current_handle.is_none() {
-                                        if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
-                                            current_stream = Some(stream);
-                                            current_handle = Some(handle);
-                                        }
+                                    current_device = host.default_output_device();
+                                    if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+                                        current_stream = Some(stream);
+                                        current_handle = Some(handle);
                                     }
                                 }
                             }
                         }
                     }
                     AudioCommand::Play(path) => {
-                        println!("AudioEngine (Thread): Iniciando reprodução -> {}", path);
+                        println!("AudioEngine: Iniciando reproduÃ§Ã£o -> {}", path);
                         
-                        // Destroi o sink anterior completamente
-                        if let Some(old_sink) = sink.take() {
-                            old_sink.stop();
-                            drop(old_sink);
+                        if let Some(old_stream) = current_cpal_stream.take() { drop(old_stream); }
+                        if let Some(old_sink) = sink.take() { old_sink.stop(); drop(old_sink); }
+                        if let Some(h) = current_bass_handle.take() {
+                            crate::bass_engine::BassEngine::stop(h).unwrap_or_default();
                         }
-                        
-                        let handle_ref = match current_handle {
-                            Some(ref h) => h,
-                            None => {
-                                eprintln!("[AUDIO] Nenhum dispositivo de saída disponível!");
-                                continue;
-                            }
-                        };
-                        
-                        // Cria um novo sink fresco
-                        let new_sink = match rodio::Sink::try_new(handle_ref) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[AUDIO] Erro ao criar novo Sink: {}", e);
-                                continue;
-                            }
-                        };
-                        new_sink.set_volume(current_volume);
                         
                         let ext = path.split('.').last().unwrap_or("").to_lowercase();
-                        is_midi = ext == "mid" || ext == "kar";
-                        is_tracker = ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it";
+                        let is_star3 = ext == "st3";
+                        is_midi = ext == "mid" || ext == "kar" || is_star3;
+                        is_tracker = ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "zip";
+                        is_legacy = ext == "mk1" || ext == "kara";
                         
-                        if is_midi {
-                            match &sf2_path {
-                                Some(sf2_path) => {
-                                    let sf2_str = sf2_path.to_string_lossy().to_string();
-                                    println!("[MIDI] Criando MidiSource com SF2={}", sf2_str);
-                                    match MidiSource::new(&path, &sf2_str) {
-                                        Ok(source) => {
-                                            println!("[MIDI] MidiSource criado com sucesso!");
-                                            new_sink.append(source);
-                                            new_sink.play();
-                                            println!("[MIDI] Sink: volume={}, empty={}, paused={}", 
-                                                new_sink.volume(), new_sink.empty(), new_sink.is_paused());
-                                        }
-                                        Err(e) => eprintln!("[MIDI] Erro no MidiSource: {}", e),
-                                    }
-                                }
-                                None => {
-                                    eprintln!("[MIDI] ERRO FATAL: Arquivo TimGM6mb.sf2 não encontrado em nenhum diretório!");
-                                }
-                            }
-                        } else if is_tracker {
-                            println!("[TRACKER] Criando TrackerSource");
-                            match TrackerSource::new(&path) {
-                                Ok(source) => {
-                                    println!("[TRACKER] TrackerSource criado com sucesso!");
-                                    new_sink.append(source);
-                                    new_sink.play();
-                                }
-                                Err(e) => eprintln!("[TRACKER] Erro no TrackerSource: {}", e),
-                            }
-                        } else {
-                            if let Ok(file) = std::fs::File::open(&path) {
-                                if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
-                                    new_sink.append(source);
-                                    new_sink.play();
-                                } else {
-                                    eprintln!("Falha ao decodificar arquivo de áudio: {}", path);
-                                }
+                        let mut final_path = path.clone();
+                        if is_star3 {
+                            if let Ok(mid_path) = crate::star3_engine::Star3Parser::decode_to_midi(&path) {
+                                final_path = mid_path;
                             } else {
-                                eprintln!("Falha ao abrir arquivo de áudio: {}", path);
+                                eprintln!("[ST3] Erro ao decodificar");
                             }
                         }
-                        
-                        current_path = Some(path);
-                        sink = Some(new_sink);
+
+                        // Formatos Legacy proprietÃ¡rios (MK1/KARA): decodificar para MIDI
+                        // e rotear para RustySynth, bypassando o BASS que nÃ£o os reconhece.
+                        if is_legacy {
+                            let decoded_result = if ext == "mk1" {
+                                crate::legacy_engine::LegacyParser::decode_mk1_to_midi(&path)
+                            } else {
+                                // .kara: pode ser MIDI puro ou MK1-encapsulado
+                                crate::legacy_engine::LegacyParser::decode_kara_to_midi(&path)
+                            };
+                            match decoded_result {
+                                Ok(mid_path) => {
+                                    println!("[LEGACY] Decodificado para MIDI: {}", mid_path);
+                                    final_path = mid_path;
+                                    is_midi = true;
+                                    is_legacy = false; // evita fallback para BASS
+                                }
+                                Err(e) => {
+                                    eprintln!("[LEGACY] Falha ao decodificar para MIDI: {}", e);
+                                    // is_legacy permanece true â†’ BASS como Ãºltima tentativa
+                                }
+                            }
+                        }
+
+                        if is_tracker || is_legacy {
+                            if let Ok(handle) = crate::bass_engine::BassEngine::load_auto(&path) {
+                                crate::bass_engine::BassEngine::set_volume(handle, current_volume).unwrap_or_default();
+                                crate::bass_engine::BassEngine::play(handle).unwrap_or_default();
+                                current_bass_handle = Some(handle);
+                            } else {
+                                eprintln!("[BASS] Erro ao carregar tracker/legacy");
+                            }
+                        } else if is_midi {
+                            if let Some(ref device) = current_device {
+                                if let Ok(config) = device.default_output_config() {
+                                    if let Some(ref sf2_path) = sf2_path {
+                                        let sf2_str = sf2_path.to_string_lossy().to_string();
+                                        match MidiSource::new(&final_path, &sf2_str, config.sample_rate().0) {
+                                            Ok(source) => {
+                                                if let Ok(stream) = build_cpal_stream(device, source, current_volume_atomic.clone()) {
+                                                    current_cpal_stream = Some(stream);
+                                                }
+                                            }
+                                            Err(e) => eprintln!("[MIDI] Erro: {}", e),
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            if current_handle.is_none() {
+                                if let Ok((stream, handle)) = rodio::OutputStream::try_default() {
+                                    current_stream = Some(stream);
+                                    current_handle = Some(handle);
+                                }
+                            }
+                            if let Some(ref h) = current_handle {
+                                if let Ok(new_sink) = rodio::Sink::try_new(h) {
+                                    new_sink.set_volume(current_volume);
+                                    if let Ok(file) = std::fs::File::open(&path) {
+                                        if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
+                                            new_sink.append(source);
+                                            new_sink.play();
+                                            sink = Some(new_sink);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        current_path = Some(final_path);
                     }
                     AudioCommand::Pause => {
                         if let Some(ref s) = sink { s.pause(); }
+                        if let Some(ref s) = current_cpal_stream { s.pause().unwrap_or(()); }
+                        if let Some(h) = current_bass_handle {
+                            crate::bass_engine::BassEngine::pause(h).unwrap_or_default();
+                        }
                     }
                     AudioCommand::Resume => {
                         if let Some(ref s) = sink { s.play(); }
+                        if let Some(ref s) = current_cpal_stream { s.play().unwrap_or(()); }
+                        if let Some(h) = current_bass_handle {
+                            crate::bass_engine::BassEngine::play(h).unwrap_or_default();
+                        }
                     }
                     AudioCommand::Stop => {
-                        if let Some(old_sink) = sink.take() {
-                            old_sink.stop();
-                            drop(old_sink);
+                        if let Some(old_stream) = current_cpal_stream.take() { drop(old_stream); }
+                        if let Some(old_sink) = sink.take() { old_sink.stop(); drop(old_sink); }
+                        if let Some(h) = current_bass_handle.take() {
+                            crate::bass_engine::BassEngine::stop(h).unwrap_or_default();
                         }
                         current_path = None;
                         is_midi = false;
+                        is_tracker = false;
+                        is_legacy = false;
                     }
                     AudioCommand::SetVolume(vol) => {
                         current_volume = vol;
+                        current_volume_atomic.store(vol.to_bits(), std::sync::atomic::Ordering::Relaxed);
                         if let Some(ref s) = sink { s.set_volume(vol); }
+                        if let Some(h) = current_bass_handle {
+                            crate::bass_engine::BassEngine::set_volume(h, vol).unwrap_or_default();
+                        }
                     }
                     AudioCommand::Seek(pos) => {
-                        if is_midi {
-                            // MIDI seek: recria o MidiSource e avança o sequencer renderizando silenciosamente
-                            if let Some(ref path) = current_path {
-                                if let Some(old_sink) = sink.take() {
-                                    old_sink.stop();
-                                    drop(old_sink);
-                                }
-                                
-                                let handle_ref = match current_handle {
-                                    Some(ref h) => h,
-                                    None => continue,
-                                };
-                                let new_sink = match rodio::Sink::try_new(handle_ref) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                new_sink.set_volume(current_volume);
-                                
-                                if let Some(ref sf2_path) = sf2_path {
-                                    let sf2_str = sf2_path.to_string_lossy().to_string();
-                                    if let Ok(mut source) = MidiSource::new(path, &sf2_str) {
-                                        // Avança o sequencer renderizando em silêncio até a posição desejada
-                                        let samples_to_skip = (pos * 44100.0) as usize;
-                                        let mut skipped = 0usize;
-                                        let buf_size = source.left_buf.len();
-                                        while skipped < samples_to_skip && !source.sequencer.end_of_sequence() {
-                                            source.sequencer.render(&mut source.left_buf, &mut source.right_buf);
-                                            skipped += buf_size;
-                                        }
-                                        source.buf_idx = buf_size * 2; // force fresh render on next sample
-                                        source.debug_printed = true; // skip debug prints
-                                        
-                                        println!("[MIDI SEEK] Avançou para {}s (skipped {} samples)", pos, skipped);
-                                        new_sink.append(source);
-                                        new_sink.play();
-                                    }
-                                }
-                                
-                                sink = Some(new_sink);
+                        if is_tracker || is_legacy {
+                            if let Some(h) = current_bass_handle {
+                                crate::bass_engine::BassEngine::seek(h, pos).unwrap_or_default();
                             }
-                        } else if is_tracker {
-                            // TODO: Implement seek for Tracker
-                            println!("[TRACKER SEEK] Seek não implementado ainda.");
-                        } else {
-                            // Áudio normal: recria o decoder e pula amostras
+                        } else if is_midi {
                             if let Some(ref path) = current_path {
-                                if let Some(old_sink) = sink.take() {
-                                    old_sink.stop();
-                                    drop(old_sink);
-                                }
-                                
-                                let handle_ref = match current_handle {
-                                    Some(ref h) => h,
-                                    None => continue,
-                                };
-                                let new_sink = match rodio::Sink::try_new(handle_ref) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                new_sink.set_volume(current_volume);
-                                
-                                if let Ok(file) = std::fs::File::open(path) {
-                                    if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
-                                        let skip_dur = Duration::from_secs_f64(pos);
-                                        // A trait rodio::Source tem skip_duration
-                                        use rodio::Source;
-                                        let skipped = source.skip_duration(skip_dur);
-                                        new_sink.append(skipped);
-                                        new_sink.play();
-                                        println!("[AUDIO SEEK] Posição: {}s", pos);
+                                if let Some(old_stream) = current_cpal_stream.take() { drop(old_stream); }
+                                if let Some(ref sf2_path) = sf2_path {
+                                    if let Some(ref device) = current_device {
+                                        if let Ok(config) = device.default_output_config() {
+                                            let sample_rate = config.sample_rate().0;
+                                            let sf2_str = sf2_path.to_string_lossy().to_string();
+                                            // TODO: seeking is_star3 requires keeping the temp path around, but this might just restart the track if it was deleted.
+                                            if let Ok(mut source) = MidiSource::new(path, &sf2_str, sample_rate) {
+                                                let samples_to_skip = (pos * sample_rate as f64) as usize;
+                                                let mut skipped = 0usize;
+                                                let buf_size = source.left_buf.len();
+                                                while skipped < samples_to_skip && !source.sequencer.end_of_sequence() {
+                                                    source.sequencer.render(&mut source.left_buf, &mut source.right_buf);
+                                                    skipped += buf_size;
+                                                }
+                                                source.buf_idx = buf_size * 2;
+                                                if let Ok(stream) = build_cpal_stream(device, source, current_volume_atomic.clone()) {
+                                                    current_cpal_stream = Some(stream);
+                                                }
+                                            }
+                                        }
                                     }
                                 }
-                                
-                                sink = Some(new_sink);
+                            }
+                        } else {
+                            if let Some(ref path) = current_path {
+                                if let Some(old_sink) = sink.take() { old_sink.stop(); }
+                                if let Some(ref h) = current_handle {
+                                    if let Ok(new_sink) = rodio::Sink::try_new(h) {
+                                        new_sink.set_volume(current_volume);
+                                        if let Ok(file) = std::fs::File::open(path) {
+                                            if let Ok(source) = rodio::Decoder::new(BufReader::new(file)) {
+                                                let skip_dur = std::time::Duration::from_secs_f64(pos);
+                                                use rodio::Source;
+                                                let skipped = source.skip_duration(skip_dur);
+                                                new_sink.append(skipped);
+                                                new_sink.play();
+                                                sink = Some(new_sink);
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -460,7 +455,6 @@ impl AudioEngine {
 
         Self { tx }
     }
-
     fn play_song(&self, path: String) {
         let _ = self.tx.send(AudioCommand::Play(path));
     }
@@ -508,18 +502,18 @@ struct CdgBatchPayload {
 
 #[tauri::command]
 async fn play_song(window: tauri::Window, state: tauri::State<'_, AppState>, path: String) -> Result<(), String> {
-    // 1. Envia o comando de Play para a Thread de Áudio nativa
+    // 1. Envia o comando de Play para a Thread de Ãudio nativa
     let engine = state.audio_engine.lock().await;
     engine.play_song(path.clone());
     
-    // Incrementa e captura o ID da música atual para cancelamento
+    // Incrementa e captura o ID da mÃºsica atual para cancelamento
     let song_id = state.current_song_id.fetch_add(1, Ordering::SeqCst) + 1;
     let song_id_tracker = state.current_song_id.clone();
     
-    // Marca o instante exato em que o áudio começou
+    // Marca o instante exato em que o Ã¡udio comeÃ§ou
     let start_time = Instant::now();
 
-    // 2. Tenta carregar os pacotes gráficos CD+G correspondentes
+    // 2. Tenta carregar os pacotes grÃ¡ficos CD+G correspondentes
     let cdg_path = path
         .rsplit_once('.')
         .map(|(base, _)| format!("{}.cdg", base))
@@ -544,7 +538,7 @@ async fn play_song(window: tauri::Window, state: tauri::State<'_, AppState>, pat
 
     let total_duration = total_packets as f64 / 300.0;
     
-    // 3. MASTER CLOCK (Thread de Streaming e Sincronização Assíncrona)
+    // 3. MASTER CLOCK (Thread de Streaming e SincronizaÃ§Ã£o AssÃ­ncrona)
     tokio::spawn(async move {
         // Aguarda meio segundo para garantir que o componente React <CdgCanvas /> foi montado e registrou o `listen` IPC
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -554,9 +548,9 @@ async fn play_song(window: tauri::Window, state: tauri::State<'_, AppState>, pat
         let mut last_sent_idx: i64 = -1;
 
         loop {
-            // Verifica se o usuário apertou Stop ou deu Play em outra música
+            // Verifica se o usuÃ¡rio apertou Stop ou deu Play em outra mÃºsica
             if song_id_tracker.load(Ordering::SeqCst) != song_id {
-                println!("Master clock abortado (nova música ou stop).");
+                println!("Master clock abortado (nova mÃºsica ou stop).");
                 break;
             }
 
@@ -587,7 +581,7 @@ async fn play_song(window: tauri::Window, state: tauri::State<'_, AppState>, pat
             }
 
             if last_sent_idx >= total_packets as i64 {
-                println!("Fim da reprodução do CDG stream.");
+                println!("Fim da reproduÃ§Ã£o do CDG stream.");
                 break;
             }
         }
@@ -636,7 +630,32 @@ async fn parse_cdg_file(path: String) -> Result<Vec<CdgCommand>, String> {
 
 #[tauri::command]
 async fn parse_midi_file(path: String) -> Result<SynthMetadata, String> {
-    SynthParser::parse_file(&path)
+    println!("[DEBUG] Tentando fazer parse do arquivo MIDI: {}", path);
+    let mut final_path = path.clone();
+    let ext = path.split('.').last().unwrap_or("").to_lowercase();
+    if ext == "st3" {
+        if let Ok(mid_path) = crate::star3_engine::Star3Parser::decode_to_midi(&path) {
+            final_path = mid_path;
+        }
+    } else if ext == "mk1" {
+        if let Ok(mid_path) = crate::legacy_engine::LegacyParser::decode_mk1_to_midi(&path) {
+            final_path = mid_path;
+        }
+    } else if ext == "kara" {
+        if let Ok(mid_path) = crate::legacy_engine::LegacyParser::decode_kara_to_midi(&path) {
+            final_path = mid_path;
+        }
+    }
+    match SynthParser::parse_file(&final_path) {
+        Ok(res) => {
+            println!("[DEBUG] Parse MIDI bem-sucedido.");
+            Ok(res)
+        }
+        Err(e) => {
+            eprintln!("[DEBUG] Falha no parse MIDI: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -646,7 +665,17 @@ async fn parse_video_file(path: String) -> Result<VideoMetadata, String> {
 
 #[tauri::command]
 async fn parse_tracker_file(path: String) -> Result<TrackerMetadata, String> {
-    TrackerParser::parse_file(&path)
+    println!("[DEBUG] Tentando fazer parse do arquivo TRACKER: {}", path);
+    match TrackerParser::parse_file(&path) {
+        Ok(res) => {
+            println!("[DEBUG] Parse TRACKER bem-sucedido.");
+            Ok(res)
+        }
+        Err(e) => {
+            eprintln!("[DEBUG] Falha no parse TRACKER: {}", e);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
@@ -735,7 +764,7 @@ fn list_output_devices() -> Result<Vec<String>, String> {
     // Add default device first
     if let Some(default) = host.default_output_device() {
         if let Ok(name) = default.name() {
-            names.push(format!("⭐ {} (Padrão)", name));
+            names.push(format!("â­ {} (PadrÃ£o)", name));
         }
     }
     
@@ -763,7 +792,7 @@ async fn set_output_device(state: tauri::State<'_, AppState>, device_name: Strin
 fn main() {
     let rt = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
 
-    // Usar diretório fora de src-tauri/ para evitar que o watcher do Tauri
+    // Usar diretÃ³rio fora de src-tauri/ para evitar que o watcher do Tauri
     // reinicie o app toda vez que o banco de dados for escrito durante o scan.
     let db_path = {
         let mut path = std::env::temp_dir();

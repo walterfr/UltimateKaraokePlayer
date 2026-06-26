@@ -162,4 +162,260 @@ impl LegacyParser {
             .unwrap_or(slice.len());
         String::from_utf8_lossy(&slice[..null_pos]).trim().to_string()
     }
+
+    // =========================================================================
+    // DECODER DE FORÇA-BRUTA: MK1 → MIDI  (v2 — varredura total de offset)
+    // Estrutura MK1 confirmada: ~30 bytes de cabeçalho binário + nome do arquivo
+    // (sem extensão) em ASCII + byte nulo + payload codificado.
+    // Como o nome NÃO inclui ".kar", pesquisamos por offset via varredura XOR total.
+    // =========================================================================
+
+    /// Decodifica um arquivo .mk1 para MIDI temporário via força-bruta.
+    pub fn decode_mk1_to_midi(path: &str) -> Result<String, String> {
+        let data = fs::read(path).map_err(|e| format!("IO error ao ler MK1: {}", e))?;
+        let mthd: &[u8] = b"MThd";
+        let scan_limit = data.len().saturating_sub(4).min(4096);
+
+        // 1. XOR estático — varredura completa de todos os offsets × todas as 256 chaves.
+        //    Complexidade: O(scan_limit × 256) ≈ ~1M comparações → millisegundos.
+        for offset in 0..=scan_limit {
+            // 1.1 Teste 1-byte XOR
+            for key in 0u8..=255 {
+                if data[offset]   ^ key == mthd[0]
+                && data[offset+1] ^ key == mthd[1]
+                && data[offset+2] ^ key == mthd[2]
+                && data[offset+3] ^ key == mthd[3] {
+                    let decoded: Vec<u8> = data[offset..].iter().map(|&b| b ^ key).collect();
+                    if Self::is_valid_midi(&decoded) {
+                        println!("[MK1] XOR estático 1-byte: offset={} key=0x{:02X}", offset, key);
+                        return Self::save_temp_midi(&decoded);
+                    }
+                }
+            }
+            
+            // 1.2 Teste 4-byte cyclic XOR ( deduced directly from MThd )
+            let mut k4 = [0u8; 4];
+            for i in 0..4 { k4[i] = data[offset + i] ^ mthd[i]; }
+            let mut test_buf4 = vec![0u8; 32.min(data.len() - offset)];
+            for i in 0..test_buf4.len() { test_buf4[i] = data[offset + i] ^ k4[i % 4]; }
+            
+            if Self::is_valid_midi(&test_buf4) {
+                let decoded: Vec<u8> = data[offset..].iter().enumerate().map(|(i, &b)| b ^ k4[i % 4]).collect();
+                if Self::is_valid_midi(&decoded) { // verify full is actually needed
+                    println!("[MK1] XOR cíclico 4-byte: offset={} key={:?}", offset, k4);
+                    return Self::save_temp_midi(&decoded);
+                }
+            }
+            
+            // 1.3 Teste 2-byte cyclic XOR ( deduced from MT )
+            let mut k2 = [0u8; 2];
+            k2[0] = data[offset] ^ mthd[0];
+            k2[1] = data[offset+1] ^ mthd[1];
+            if data[offset+2] ^ k2[0] == mthd[2] && data[offset+3] ^ k2[1] == mthd[3] {
+                let mut test_buf2 = vec![0u8; 32.min(data.len() - offset)];
+                for i in 0..test_buf2.len() { test_buf2[i] = data[offset + i] ^ k2[i % 2]; }
+                
+                if Self::is_valid_midi(&test_buf2) {
+                    let decoded: Vec<u8> = data[offset..].iter().enumerate().map(|(i, &b)| b ^ k2[i % 2]).collect();
+                    if Self::is_valid_midi(&decoded) {
+                        println!("[MK1] XOR cíclico 2-byte: offset={} key={:?}", offset, k2);
+                        return Self::save_temp_midi(&decoded);
+                    }
+                }
+            }
+        }
+
+        // 2. Subtração estática — mesma lógica, (byte - key) mod 256.
+        for offset in 0..=scan_limit {
+            for key in 1u8..=255 {
+                if data[offset]  .wrapping_sub(key) == mthd[0]
+                && data[offset+1].wrapping_sub(key) == mthd[1]
+                && data[offset+2].wrapping_sub(key) == mthd[2]
+                && data[offset+3].wrapping_sub(key) == mthd[3] {
+                    let decoded: Vec<u8> = data[offset..].iter().map(|&b| b.wrapping_sub(key)).collect();
+                    if Self::is_valid_midi(&decoded) {
+                        println!("[MK1] Subtração: offset={} key=0x{:02X}", offset, key);
+                        return Self::save_temp_midi(&decoded);
+                    }
+                }
+            }
+        }
+        let data = fs::read(path).map_err(|e| format!("IO error: {}", e))?;
+        if data.len() < 30 || data[0..4] != [0x87, 0x0a, 0xd6, 0x30] {
+            return Err("Not a valid MK1 file (invalid header)".to_string());
+        }
+
+        let name_len = (data[26] as usize) | ((data[27] as usize) << 8);
+        let payload_start = 30 + name_len;
+        
+        let comp_size = (data[18] as usize) 
+                      | ((data[19] as usize) << 8)
+                      | ((data[20] as usize) << 16)
+                      | ((data[21] as usize) << 24);
+                      
+        if payload_start + comp_size > data.len() {
+            return Err("MK1 file truncated or corrupted".to_string());
+        }
+        
+        let payload = &data[payload_start..payload_start + comp_size];
+        
+        struct XorReader<'a> {
+            data: &'a [u8],
+            key: &'a [u8],
+            pos: usize,
+        }
+        impl<'a> std::io::Read for XorReader<'a> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let rem = self.data.len() - self.pos;
+                if rem == 0 { return Ok(0); }
+                let to_read = std::cmp::min(rem, buf.len());
+                for i in 0..to_read {
+                    buf[i] = self.data[self.pos + i] ^ self.key[(self.pos + i) % self.key.len()];
+                }
+                self.pos += to_read;
+                Ok(to_read)
+            }
+        }
+
+        // Test 1-byte keys
+        for k in 0..=255u8 {
+            let key = [k];
+            let reader = XorReader { data: payload, key: &key, pos: 0 };
+            let mut decoder = flate2::read::DeflateDecoder::new(reader);
+            let mut uncompressed = Vec::new();
+            if std::io::Read::read_to_end(&mut decoder, &mut uncompressed).is_ok() {
+                if Self::is_valid_midi(&uncompressed) {
+                    println!("[MK1] Decoded with 1-byte XOR key: 0x{:02X}", k);
+                    return Self::save_temp_midi(&uncompressed);
+                }
+            }
+        }
+
+        // Test 2-byte keys
+        for k0 in 0..=255u8 {
+            for k1 in 0..=255u8 {
+                let key = [k0, k1];
+                let reader = XorReader { data: payload, key: &key, pos: 0 };
+                let mut decoder = flate2::read::DeflateDecoder::new(reader);
+                let mut uncompressed = Vec::new();
+                if std::io::Read::read_to_end(&mut decoder, &mut uncompressed).is_ok() {
+                    if Self::is_valid_midi(&uncompressed) {
+                        println!("[MK1] Decoded with 2-byte XOR key: 0x{:02X}{:02X}", k0, k1);
+                        return Self::save_temp_midi(&uncompressed);
+                    }
+                }
+            }
+        }
+
+        Err("Failed to decrypt MK1 with 1-byte and 2-byte XOR".to_string())
+    }
+
+    /// Critério forte de MIDI válido:
+    /// - Começa com MThd
+    /// - Bytes 4-7 = 0x00 0x00 0x00 0x06 (tamanho do header MIDI = 6)
+    /// - Bytes 14-17 = MTrk (primeiro track logo após os 14 bytes de header)
+    fn is_valid_midi(data: &[u8]) -> bool {
+        data.len() >= 22
+            && &data[0..4] == b"MThd"
+            && data[4] == 0 && data[5] == 0 && data[6] == 0 && data[7] == 6
+            && data.len() > 18
+            && &data[14..18] == b"MTrk"
+    }
+
+    /// Localiza o offset após o fim da primeira string ASCII longa no cabeçalho MK1.
+    /// O header MK1 tem ~30 bytes binários seguidos pelo nome do arquivo (sem extensão).
+    fn find_ascii_string_end(data: &[u8]) -> Option<usize> {
+        let mut in_run = false;
+        let mut run_start = 0usize;
+
+        for i in 4..data.len().min(256) {
+            let printable = data[i] >= 0x20 && data[i] < 0x7F;
+            if printable && !in_run {
+                in_run = true;
+                run_start = i;
+            } else if !printable && in_run {
+                in_run = false;
+                if i - run_start >= 5 {
+                    // Sequência longa o suficiente para ser um nome de arquivo
+                    let mut j = i;
+                    while j < data.len().min(i + 64) && data[j] < 0x20 { j += 1; }
+                    if j < data.len() {
+                        println!("[MK1] Fim do nome do arquivo no offset {}, payload estimado no offset {}", i, j);
+                        return Some(j);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Processa um arquivo .kara: pode ser MIDI puro ou MK1-encapsulado.
+    pub fn decode_kara_to_midi(path: &str) -> Result<String, String> {
+        let data = fs::read(path).map_err(|e| format!("IO error ao ler KARA: {}", e))?;
+
+        if data.starts_with(b"MThd") {
+            println!("[KARA] Arquivo MIDI puro detectado");
+            return Self::save_temp_midi(&data);
+        }
+
+        // Tentar XOR estático em todo o arquivo (caso seja MK1-encapsulado)
+        let mthd: &[u8] = b"MThd";
+        let scan_limit = data.len().saturating_sub(4).min(4096);
+        for offset in 0..=scan_limit {
+            for key in 0u8..=255 {
+                if data[offset]   ^ key == mthd[0]
+                && data[offset+1] ^ key == mthd[1]
+                && data[offset+2] ^ key == mthd[2]
+                && data[offset+3] ^ key == mthd[3] {
+                    let decoded: Vec<u8> = data[offset..].iter().map(|&b| b ^ key).collect();
+                    if Self::is_valid_midi(&decoded) {
+                        println!("[KARA] XOR estático 1-byte: offset={} key=0x{:02X}", offset, key);
+                        return Self::save_temp_midi(&decoded);
+                    }
+                }
+            }
+            
+            // 4-byte cyclic
+            let mut k4 = [0u8; 4];
+            for i in 0..4 { k4[i] = data[offset + i] ^ mthd[i]; }
+            let mut test_buf4 = vec![0u8; 32.min(data.len() - offset)];
+            for i in 0..test_buf4.len() { test_buf4[i] = data[offset + i] ^ k4[i % 4]; }
+            if Self::is_valid_midi(&test_buf4) {
+                let decoded: Vec<u8> = data[offset..].iter().enumerate().map(|(i, &b)| b ^ k4[i % 4]).collect();
+                if Self::is_valid_midi(&decoded) {
+                    println!("[KARA] XOR cíclico 4-byte: offset={} key={:?}", offset, k4);
+                    return Self::save_temp_midi(&decoded);
+                }
+            }
+            
+            // 2-byte cyclic
+            let mut k2 = [0u8; 2];
+            k2[0] = data[offset] ^ mthd[0];
+            k2[1] = data[offset+1] ^ mthd[1];
+            if data[offset+2] ^ k2[0] == mthd[2] && data[offset+3] ^ k2[1] == mthd[3] {
+                let mut test_buf2 = vec![0u8; 32.min(data.len() - offset)];
+                for i in 0..test_buf2.len() { test_buf2[i] = data[offset + i] ^ k2[i % 2]; }
+                if Self::is_valid_midi(&test_buf2) {
+                    let decoded: Vec<u8> = data[offset..].iter().enumerate().map(|(i, &b)| b ^ k2[i % 2]).collect();
+                    if Self::is_valid_midi(&decoded) {
+                        println!("[KARA] XOR cíclico 2-byte: offset={} key={:?}", offset, k2);
+                        return Self::save_temp_midi(&decoded);
+                    }
+                }
+            }
+        }
+
+        Err("KARA: não é MIDI padrão nem decodificável por XOR simples".to_string())
+    }
+
+    /// Salva bytes em arquivo .mid temporário e retorna o caminho.
+    fn save_temp_midi(data: &[u8]) -> Result<String, String> {
+        let temp_dir = std::env::temp_dir();
+        let filename = format!("ukp_legacy_{}.mid", uuid::Uuid::new_v4());
+        let mid_path = temp_dir.join(&filename);
+        std::fs::write(&mid_path, data)
+            .map_err(|e| format!("Erro ao salvar MIDI temporário: {}", e))?;
+        println!("[LEGACY] MIDI temporário salvo em: {}", mid_path.display());
+        Ok(mid_path.to_string_lossy().to_string())
+    }
 }
